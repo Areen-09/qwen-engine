@@ -42,10 +42,12 @@ jobs:
 
       - name: Install Windows CUDA Toolkit (12.1)
         if: runner.os == 'Windows'
-        uses: Jimver/cuda-toolkit@v0.2.14
+        uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: '12.1.1'
           method: 'network'
+          sub-packages: '["nvcc", "cudart", "cudart_dev"]'
+          use-github-cache: false
 
       - name: Install cibuildwheel
         run: python -m pip install cibuildwheel>=2.19.0
@@ -75,8 +77,8 @@ jobs:
             CMAKE_CUDA_ARCHITECTURES="75;80;86;89;90;90-virtual"
             CUDA_USE_STATIC_CUDA_RUNTIME="ON"
           CIBW_BEFORE_ALL_LINUX: >-
-            yum-config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo &&
-            yum install -y cuda-compiler-12-1 cuda-cudart-devel-12-1 cuda-minimal-build-12-1
+            curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo -o /etc/yum.repos.d/cuda-rhel8.repo &&
+            dnf install -y --nogpgcheck cuda-compiler-12-1 cuda-cudart-devel-12-1
           CIBW_BEFORE_BUILD: "pip install nanobind scikit-build-core ninja"
           CIBW_BUILD_VERBOSITY: 1
         run: python -m cibuildwheel --output-dir dist

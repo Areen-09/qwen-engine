@@ -7,7 +7,7 @@ name = "qwen-engine"
 version = "0.1.0"
 description = "Bare-metal zero-dependency C++20/CUDA inference engine for Qwen2.5-1.5B"
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = { text = "MIT" }
 authors = [
     { name = "Areen-09" }
 ]
@@ -18,7 +18,7 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
-    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
