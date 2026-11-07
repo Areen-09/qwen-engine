@@ -5,6 +5,7 @@ if(POLICY CMP0141)
 endif()
 
 set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "Embedded")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -allow-unsupported-compiler")
 
 project(qwen25_cuda LANGUAGES CXX CUDA)
 
@@ -50,6 +51,7 @@ else()
         $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
         $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+        $<$<COMPILE_LANGUAGE:CUDA>:-allow-unsupported-compiler>
     )
 endif()
 
