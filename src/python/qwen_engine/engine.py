@@ -83,22 +83,36 @@ class Engine:
     @classmethod
     def from_pretrained(
         cls,
-        model_id_or_path: str,
+        model_id_or_path: Optional[Union[str, Path]] = None,
+        tokenizer_path: Optional[Union[str, Path]] = None,
         device_id: int = 0,
         cache_dir: Optional[Union[str, Path]] = None,
+        model_path: Optional[Union[str, Path]] = None,
+        **kwargs,
     ) -> Engine:
         """
-        Instantiate an engine, automatically retrieving model weights and
-        tokenizer binary if needed.
+        Instantiate an engine from local file paths, an existing directory, or
+        by automatically downloading weights from Hugging Face.
 
         Args:
             model_id_or_path: Model alias (e.g. 'qwen2.5-1.5b-w4a16'),
-                Hugging Face repo ID, or local directory path.
-            device_id: Target GPU device ID.
+                Hugging Face repo ID, or local file/directory path.
+            tokenizer_path: Path to the binary tokenizer.bin.
+            device_id: Target GPU device ID (default: 0).
             cache_dir: Custom directory to store downloaded models.
+            model_path: Alias for model_id_or_path.
         """
-        model_path, tokenizer_path = download(model_id_or_path, cache_dir=cache_dir)
-        return cls(model_path=model_path, tokenizer_path=tokenizer_path, device_id=device_id)
+        target_model = model_path or model_id_or_path
+        if target_model is None:
+            raise ValueError("model_id_or_path or model_path must be provided.")
+
+        target_p = Path(target_model)
+        if target_p.is_file():
+            return cls(model_path=target_p, tokenizer_path=tokenizer_path, device_id=device_id)
+
+        resolved_model, resolved_tok = download(str(target_model), cache_dir=cache_dir)
+        actual_tok = tokenizer_path or resolved_tok
+        return cls(model_path=resolved_model, tokenizer_path=actual_tok, device_id=device_id)
 
     @property
     def device_id(self) -> int:
