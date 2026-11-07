@@ -1,129 +1,220 @@
-# Custom CUDA Inference Engine for Qwen2.5-1.5B (RTX 3050 Laptop / sm_86)
+# qwen-engine: Bare-Metal CUDA & Python Inference Engine
 
-A high-performance C++20 and custom CUDA inference engine built from scratch for `Qwen2.5-1.5B-Instruct` on NVIDIA RTX 3050 Laptop GPU (Ampere `sm_86`, 4 GB VRAM) under Windows WDDM.
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![CUDA 11.8+](https://img.shields.io/badge/CUDA-11.8%2B%20%7C%2012.x%20%7C%2013.x-green.svg)](https://developer.nvidia.com/cuda-toolkit)
+[![C++20](https://img.shields.io/badge/C%2B%2B-20-purple.svg)](https://en.cppreference.com/w/cpp/20)
+[![Wheels CI](https://github.com/Areen-09/qwen-engine/actions/workflows/wheels.yml/badge.svg)](https://github.com/Areen-09/qwen-engine/actions/workflows/wheels.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-The engine operates with **zero external math runtime libraries** (`cuBLAS`, `cuDNN`, `CUTLASS`, or `libtorch`). Every operation—RMSNorm, GEMV, SwiGLU, RoPE, Grouped-Query Attention (GQA), INT4 dequantization, and sampling—is implemented in custom CUDA kernels.
+A high-performance C++20 and custom CUDA inference engine and Python package built from scratch for `Qwen2.5-1.5B-Instruct`. Designed to run at maximum memory bandwidth with zero external math runtime libraries—**no cuBLAS, cuDNN, CUTLASS, or PyTorch** required at runtime.
 
----
-
-## Key Features
-
-1. **Strict 4 GB VRAM Budget via Static Arena:**
-   - Single `cudaMalloc` allocation at startup with startup headroom validation.
-   - **Phase 1 (FP16 Baseline):** ~3,234 MB total discrete VRAM (fits comfortably within the ~3,600 MB usable WDDM budget).
-   - **Phase 2 (W4A16 Group-128):** ~943 MB total discrete VRAM (leaves >2.6 GB free headroom).
-2. **Zero-Update Device-Driven CUDA Graph:**
-   - Captures the entire 28-layer transformer forward pass and sampling reduction into a single device-driven `cudaGraphExec_t`.
-   - Sequence position and token IDs are updated directly in GPU global memory (`DeviceControlBlock`), eliminating host `cudaGraphExecUpdate` calls.
-3. **Quantized Tied Embeddings (`120.3 MB` vs `466.8 MB`):**
-   - The tied `151936 x 1536` token embedding table is symmetrically quantized to W4A16 (Group 128).
-   - On-the-fly row dequantization during input embedding lookup takes `< 2 microseconds`, cutting per-token memory traffic on `lm_head` by 74%.
-4. **GQA 6:1 Split-K FlashDecoding:**
-   - Launches a 2D grid `(NUM_KV_HEADS=2, FLASH_DECODE_SPLITS=16)` (32 thread blocks) to saturate all 16 SMs on the RTX 3050.
-   - Caches the 6 Query heads in shared memory once, streaming KV cache tokens with 6x reduced bandwidth.
-5. **Stateful KV Prefix Caching & Chunked Prefill:**
-   - Detects the longest common prefix across multi-turn chat sessions so only new prompt tokens undergo prefill.
-   - Processes long prompts in outer host chunks (`PREFILL_MAX_CHUNK = 256`) to stay within WDDM TDR driver timeout limits.
-6. **Zero-dGPU-VRAM Web UI:**
-   - Single-file vanilla HTML/CSS/JS chat frontend rendered on the Intel integrated GPU (`0 MB` RTX 3050 VRAM consumed).
-   - Real-time token streaming over Server-Sent Events (SSE).
+The compiled Python extension statically bundles the CUDA runtime (`CUDA::cudart_static`), allowing end users to run high-throughput LLM inference on any system with NVIDIA drivers (`>= 450.80.02`), without requiring the CUDA Toolkit to be installed.
 
 ---
 
-## Prerequisites
+## Key Highlights
 
-- **GPU:** NVIDIA GeForce RTX 3050 Laptop GPU (or any Ampere `sm_86` GPU).
-- **OS:** Windows 10/11 64-bit.
-- **CUDA Toolkit:** CUDA 12.0+ or 13.0+ (`nvcc` on PATH).
-- **C++ Compiler:** Microsoft Visual Studio (MSVC with C++20 support).
-- **Build System:** CMake 3.26+ and Ninja or MSBuild.
-- **Python:** Python 3.10+ with `uv` or `pip` (`torch`, `transformers`, `safetensors`).
+- **Zero Math Runtime Dependencies:** Handcrafted CUDA kernels for RMSNorm, RoPE, Grouped-Query Attention (GQA), W4A16 GEMV, SwiGLU, and fused device sampling.
+- **Ultra-Low Memory Footprint (<1 GB VRAM):**
+  - **W4A16 (Group 128):** ~943 MB total discrete VRAM for weights, activations, and KV cache. Runs comfortably on 4 GB laptop GPUs (e.g. RTX 3050).
+  - **FP16 Baseline:** ~3,234 MB total discrete VRAM.
+- **Zero-Update Device-Driven CUDA Graphs:** Forward pass and sampling reduction are captured into a single CUDA graph. Sequence positions and token IDs are updated in device global memory via a `DeviceControlBlock`, avoiding host graph updates.
+- **Tied Embedding Quantization (120 MB vs 467 MB):** The tied `151936 x 1536` vocabulary table is symmetrically quantized to W4A16. Row dequantization during input lookup takes `<2 µs`, cutting `lm_head` memory bandwidth by 74%.
+- **GQA 6:1 Split-K FlashDecoding:** 2D grid `(NUM_KV_HEADS=2, FLASH_DECODE_SPLITS=16)` saturates all SMs, caching Query heads in shared memory once and streaming KV cache tokens with 6x reduced bandwidth.
+- **Pythonic High-Level API:** Full Python package (`qwen-engine`) featuring synchronous/asynchronous token streaming, transactional session rollback, HuggingFace auto-downloading, and native exception handling.
 
 ---
 
-## Quick Start
+## Python Package Quickstart
 
-### 1. Offline Model Export & Golden Reference Dump
+### Installation
 
-Using `uv` (recommended):
-```powershell
-# Sync Python dependencies
-uv sync
-
-# Export FP16 model and binary tokenizer
-.venv\Scripts\python.exe tools/export_qwen25.py --mode fp16 --out models/qwen25_1.5b_fp16.qwenbin --tokenizer-out models/tokenizer.bin
-
-# Export W4A16 model
-.venv\Scripts\python.exe tools/export_qwen25.py --mode w4a16 --out models/qwen25_1.5b_w4a16.qwenbin --tokenizer-out models/tokenizer.bin
-
-# Generate PyTorch golden reference dump for kernel testing
-.venv\Scripts\python.exe tools/verify_reference.py --out models/golden_ref.bin
+From repository source:
+```bash
+pip install .
 ```
 
-### 2. Build with CMake
+Or for development (editable mode):
+```bash
+pip install -e . --no-build-isolation
+```
+
+*Requirements: NVIDIA GPU (Compute Capability 7.5 to 9.0), NVIDIA driver, and Python 3.9+.*
+
+---
+
+### Basic Generation
+
+```python
+from qwen_engine import Engine, SamplingParams
+
+# Load local weights or download from HuggingFace cache
+engine = Engine.from_pretrained(
+    model_path="models/qwen25_1.5b_w4a16.qwenbin",
+    tokenizer_path="models/tokenizer.bin",
+    device_id=0,
+)
+
+# Generate completion
+response = engine.generate(
+    prompt="Explain quantum entanglement in two simple sentences.",
+    sampling_params=SamplingParams(temperature=0.7, top_p=0.9, max_tokens=128),
+)
+print(response)
+```
+
+---
+
+### Real-Time Synchronous Streaming
+
+```python
+from qwen_engine import Engine, SamplingParams
+
+engine = Engine.from_pretrained("models/qwen25_1.5b_w4a16.qwenbin", "models/tokenizer.bin")
+
+params = SamplingParams(temperature=0.8, top_k=50, max_tokens=256)
+for token_text in engine.stream("Write a short haiku about GPUs:", sampling_params=params):
+    print(token_text, end="", flush=True)
+print()
+```
+
+---
+
+### Real-Time Asynchronous Streaming (FastAPI / Web Serving)
+
+The native engine releases the Python GIL during decode iterations, allowing concurrent execution:
+
+```python
+import asyncio
+from qwen_engine import Engine, SamplingParams
+
+async def stream_chat():
+    engine = Engine.from_pretrained("models/qwen25_1.5b_w4a16.qwenbin", "models/tokenizer.bin")
+    
+    async for token in engine.stream_async("Tell me three fun facts about space:"):
+        print(token, end="", flush=True)
+    print()
+
+asyncio.run(stream_chat())
+```
+
+---
+
+### Multi-Turn Chat & Transactional Rollback
+
+`Engine` retains KV cache state across calls. If generation is interrupted or rejected, you can roll back to any sequence checkpoint without recomputing prefill:
+
+```python
+from qwen_engine import Engine
+
+engine = Engine.from_pretrained("models/qwen25_1.5b_w4a16.qwenbin", "models/tokenizer.bin")
+
+messages = [
+    {"role": "system", "content": "You are a concise programming assistant."},
+    {"role": "user", "content": "What is RAII in C++?"}
+]
+
+# 1. Format ChatML prompt
+prompt = engine.tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+
+# 2. Checkpoint session position before generation
+checkpoint = engine.current_seq_pos
+
+try:
+    for chunk in engine.stream(prompt):
+        print(chunk, end="", flush=True)
+except KeyboardInterrupt:
+    # 3. Rollback KV cache to checkpoint cleanly
+    engine.rollback_to(checkpoint)
+    print("\n[Generation cancelled; KV cache rolled back]")
+```
+
+---
+
+## C++ Engine & Standalone Tools
+
+For maximum throughput and standalone deployment without Python, you can build the native C++ binaries directly:
+
+### 1. Build via CMake
 
 ```powershell
-# Configure build
-cmake -B build -DCMAKE_BUILD_TYPE=Release
+# Configure release build with Ninja
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
-# Build all targets in parallel
+# Build binaries
 cmake --build build --config Release --parallel
 ```
 
-This generates three release binaries:
-- `build/Release/test_kernels.exe`
-- `build/Release/cli_bench.exe`
-- `build/Release/qwen_server.exe`
+Binaries produced:
+- `build/cli_bench.exe`: Microbenchmark harness for prefill and decode throughput.
+- `build/qwen_server.exe`: Standalone lightweight HTTP/SSE chat server.
+- `build/test_kernels.exe`: Kernel correctness verification suite.
 
-### 3. Run Kernel Unit & Parity Verification Tests
-
-```powershell
-./build/Release/test_kernels.exe --golden models/golden_ref.bin --fp16 models/qwen25_1.5b_fp16.qwenbin --w4a16 models/qwen25_1.5b_w4a16.qwenbin
-```
-
-All 8 verification suites test:
-1. `embed_lookup_fp16` (exact match) and `embed_lookup_w4a16` (cosine sim >= 0.998)
-2. `rmsnorm_fp16` (max abs err <= 1e-3)
-3. `qkv_bias_rope_kv_append` (max abs err <= 1e-3)
-4. `gemv_fp16` & `gemv_dual_gate_up_swiglu_fp16` (max abs err <= 5e-3)
-5. `gemv_w4a16` & `gemv_dual_gate_up_swiglu_w4a16` (cosine sim >= 0.995)
-6. `gemm_prefill_fp16` & `gemm_prefill_w4a16` (max abs err <= 5e-3, cosine sim >= 0.995)
-7. `attention_gqa_flash_decode` vs prefill attention (max abs err <= 2e-3)
-8. Device argmax / Gumbel-Max sampling & 28-layer greedy token parity against PyTorch
-
-### 4. Deterministic CLI Benchmarking
-
-Benchmark W4A16 mode:
-```powershell
-./build/Release/cli_bench.exe --model models/qwen25_1.5b_w4a16.qwenbin --prompt-len 128 --gen-len 256 --warmup 10 --runs 50
-```
-
-Benchmark FP16 mode:
-```powershell
-./build/Release/cli_bench.exe --model models/qwen25_1.5b_fp16.qwenbin --prompt-len 128 --gen-len 256 --warmup 10 --runs 50
-```
-
-### 5. Launch Local HTTP/SSE Chat Server
+### 2. Export Weights from HuggingFace
 
 ```powershell
-./build/Release/qwen_server.exe --model models/qwen25_1.5b_w4a16.qwenbin --port 8080
+# Export FP16 model and tokenizer
+python tools/export_qwen25.py --mode fp16 --out models/qwen25_1.5b_fp16.qwenbin --tokenizer-out models/tokenizer.bin
+
+# Export W4A16 quantized model
+python tools/export_qwen25.py --mode w4a16 --out models/qwen25_1.5b_w4a16.qwenbin --tokenizer-out models/tokenizer.bin
 ```
-Then open `http://127.0.0.1:8080` in your web browser. Ensure your browser runs on the Intel integrated GPU in Windows Graphics Settings to ensure 0 MB discrete RTX 3050 VRAM is used for UI rendering.
+
+### 3. Run Deterministic CLI Benchmark
+
+```powershell
+./build/cli_bench.exe --model models/qwen25_1.5b_w4a16.qwenbin --prompt-len 128 --gen-len 256 --warmup 10 --runs 50
+```
+
+### 4. Run the Zero-dGPU-VRAM Web UI
+
+```powershell
+./build/qwen_server.exe --model models/qwen25_1.5b_w4a16.qwenbin --port 8080
+```
+Open `http://127.0.0.1:8080` in your browser. The single-page HTML frontend streams responses via Server-Sent Events (SSE).
 
 ---
 
-## Architecture Constants
+## Testing & Verification
 
-| Constant | Value | Description |
+Run the Python binding test suite (covers tokenization, ChatML, multi-byte UTF-8 streaming, greedy generation, rollback, session leases, and exceptions):
+
+```bash
+pytest tests/test_python_bindings.py -v
+```
+
+Run native CUDA kernel parity tests against PyTorch golden references:
+
+```powershell
+./build/test_kernels.exe --golden models/golden_ref.bin --w4a16 models/qwen25_1.5b_w4a16.qwenbin
+```
+
+---
+
+## Architecture Specifications
+
+| Parameter | Value | Description |
 | :--- | :--- | :--- |
-| `NUM_LAYERS` | `28` | Number of transformer decoder layers |
-| `HIDDEN_SIZE` | `1536` | Residual stream dimension |
-| `INTERMEDIATE_SIZE` | `8960` | SwiGLU MLP dimension |
-| `NUM_Q_HEADS` | `12` | Query attention heads |
-| `NUM_KV_HEADS` | `2` | Key/Value attention heads (6:1 GQA) |
-| `HEAD_DIM` | `128` | Dimension per head |
-| `VOCAB_SIZE` | `151936` | Padded vocabulary size |
-| `MAX_SEQ_LEN` | `4096` | Fixed KV Cache token capacity |
-| `QUANT_GROUP_SIZE` | `128` | Group size for symmetric W4A16 |
-| `PREFILL_MAX_CHUNK`| `256` | Maximum outer prefill chunk |
+| **`NUM_LAYERS`** | `28` | Transformer decoder layers |
+| **`HIDDEN_SIZE`** | `1536` | Residual hidden dimension ($d$) |
+| **`INTERMEDIATE_SIZE`** | `8960` | SwiGLU MLP intermediate dimension |
+| **`NUM_Q_HEADS`** | `12` | Query attention heads |
+| **`NUM_KV_HEADS`** | `2` | Key/Value attention heads (6:1 GQA) |
+| **`HEAD_DIM`** | `128` | Dimension per attention head |
+| **`VOCAB_SIZE`** | `151936` | Padded vocabulary size |
+| **`MAX_SEQ_LEN`** | `4096` | Maximum KV cache context length |
+| **`QUANT_GROUP_SIZE`** | `128` | Symmetric scale grouping for W4A16 |
+| **`PREFILL_MAX_CHUNK`** | `256` | Outer prefill chunk size (WDDM TDR safe) |
 
+---
+
+## Documentation
+
+For an in-depth guide on advanced Python streaming, exception handling, custom tokenization, and architecture deep dives, see:
+📖 **[Walkthrough Guide: Using qwen-engine](docs/walkthrough_qwen_engine.md)**
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
