@@ -40,6 +40,10 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set up MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Install Windows CUDA Toolkit (12.1)
         if: runner.os == 'Windows'
         uses: Jimver/cuda-toolkit@v0.2.36
@@ -73,14 +77,18 @@ jobs:
           CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
           CIBW_ENVIRONMENT: >-
             CUDA_PATH=/usr/local/cuda-12.1
-            PATH=/usr/local/cuda-12.1/bin:$PATH
-            LD_LIBRARY_PATH=/usr/local/cuda-12.1/lib64:$LD_LIBRARY_PATH
+            PATH=/opt/rh/gcc-toolset-12/root/usr/bin:/usr/local/cuda-12.1/bin:$PATH
+            LD_LIBRARY_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64:/usr/local/cuda-12.1/lib64:$LD_LIBRARY_PATH
+            CC=/opt/rh/gcc-toolset-12/root/usr/bin/gcc
+            CXX=/opt/rh/gcc-toolset-12/root/usr/bin/g++
+            CUDAHOSTCXX=/opt/rh/gcc-toolset-12/root/usr/bin/g++
+            CMAKE_CUDA_HOST_COMPILER=/opt/rh/gcc-toolset-12/root/usr/bin/g++
             CMAKE_CUDA_ARCHITECTURES="75;80;86;89;90;90-virtual"
             CUDA_USE_STATIC_CUDA_RUNTIME="ON"
             CMAKE_CUDA_FLAGS="-allow-unsupported-compiler"
           CIBW_BEFORE_ALL_LINUX: >-
             curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo -o /etc/yum.repos.d/cuda-rhel8.repo &&
-            dnf install -y --nogpgcheck cuda-compiler-12-1 cuda-cudart-devel-12-1
+            dnf install -y --nogpgcheck cuda-compiler-12-1 cuda-cudart-devel-12-1 gcc-toolset-12-gcc gcc-toolset-12-gcc-c++
           CIBW_BEFORE_BUILD: "pip install nanobind scikit-build-core ninja"
           CIBW_BUILD_VERBOSITY: 1
         run: python -m cibuildwheel --output-dir dist
