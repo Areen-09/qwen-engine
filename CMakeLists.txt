@@ -7,6 +7,13 @@ endif()
 set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "Embedded")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -allow-unsupported-compiler")
 
+# Support multi-architecture CUDA targets (T4, A100, RTX 30/40, H100)
+if(DEFINED ENV{CMAKE_CUDA_ARCHITECTURES})
+    set(CMAKE_CUDA_ARCHITECTURES $ENV{CMAKE_CUDA_ARCHITECTURES})
+else()
+    set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90;90-virtual")
+endif()
+
 project(qwen25_cuda LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -16,15 +23,6 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 set(CUDA_USE_STATIC_CUDA_RUNTIME ON)
 set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
-
-# Support multi-architecture CUDA targets (T4, A100, RTX 30/40, H100)
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    if(DEFINED ENV{CMAKE_CUDA_ARCHITECTURES})
-        set(CMAKE_CUDA_ARCHITECTURES $ENV{CMAKE_CUDA_ARCHITECTURES})
-    else()
-        set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90;90-virtual")
-    endif()
-endif()
 
 find_package(CUDAToolkit REQUIRED)
 
@@ -74,6 +72,7 @@ set(CORE_SOURCES
 add_library(qwen_core STATIC ${CORE_SOURCES})
 set_target_properties(qwen_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 set_target_properties(qwen_core PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+set_target_properties(qwen_core PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 target_link_libraries(qwen_core PUBLIC CUDA::cudart_static)
 
 # Nanobind Python Bindings Target

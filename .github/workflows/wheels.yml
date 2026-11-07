@@ -44,11 +44,11 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Install Windows CUDA Toolkit (12.1)
+      - name: Install Windows CUDA Toolkit (12.4)
         if: runner.os == 'Windows'
         uses: Jimver/cuda-toolkit@v0.2.36
         with:
-          cuda: '12.1.1'
+          cuda: '12.4.1'
           method: 'network'
           sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
           use-github-cache: false
@@ -76,9 +76,9 @@ jobs:
           CIBW_ARCHS: ${{ matrix.cibw_arch }}
           CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
           CIBW_ENVIRONMENT: >-
-            CUDA_PATH=/usr/local/cuda-12.1
-            PATH=/opt/rh/gcc-toolset-12/root/usr/bin:/usr/local/cuda-12.1/bin:$PATH
-            LD_LIBRARY_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64:/usr/local/cuda-12.1/lib64:$LD_LIBRARY_PATH
+            CUDA_PATH=/usr/local/cuda-12.4
+            PATH=/opt/rh/gcc-toolset-12/root/usr/bin:/usr/local/cuda-12.4/bin:$PATH
+            LD_LIBRARY_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64:/usr/local/cuda-12.4/lib64:$LD_LIBRARY_PATH
             CC=/opt/rh/gcc-toolset-12/root/usr/bin/gcc
             CXX=/opt/rh/gcc-toolset-12/root/usr/bin/g++
             CUDAHOSTCXX=/opt/rh/gcc-toolset-12/root/usr/bin/g++
@@ -88,7 +88,7 @@ jobs:
             CMAKE_CUDA_FLAGS="-allow-unsupported-compiler"
           CIBW_BEFORE_ALL_LINUX: >-
             curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo -o /etc/yum.repos.d/cuda-rhel8.repo &&
-            dnf install -y --nogpgcheck cuda-compiler-12-1 cuda-cudart-devel-12-1 gcc-toolset-12-gcc gcc-toolset-12-gcc-c++
+            dnf install -y --nogpgcheck cuda-compiler-12-4 cuda-cudart-devel-12-4 gcc-toolset-12-gcc gcc-toolset-12-gcc-c++
           CIBW_BEFORE_BUILD: "pip install nanobind scikit-build-core ninja"
           CIBW_BUILD_VERBOSITY: 1
         run: python -m cibuildwheel --output-dir dist
