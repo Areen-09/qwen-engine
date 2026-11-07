@@ -1,0 +1,87 @@
+# ==============================================================================
+# Git Ignore for qwen-engine (CUDA C++20 + Python package)
+# ==============================================================================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+*.dylib
+*.dll
+
+# C++ / CUDA Build artifacts
+build/
+_build/
+bin/
+*.obj
+*.o
+*.lib
+*.a
+*.exp
+*.pdb
+*.ilk
+*.manifest
+*.res
+*.exe
+
+# CMake artifacts (in case configured outside build/)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CMakeScripts/
+Makefile
+build.ninja
+.ninja_*
+
+# Distribution & Wheel packaging
+dist/
+*.egg-info/
+.eggs/
+*.whl
+*.tar.gz
+*.zip
+
+# Third-party benchmark binaries
+tools/llama_cpp/
+
+# Virtual Environments
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Testing & Linting
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Large Model Binaries (> 700 MB)
+models/*.qwenbin
+models/*.gguf
+models/*.bin
+!models/.gitkeep
+
+# IDEs and Editors
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Logs and Scratch Files
+scratch/
+*.log
+*.tmp
+*.bak
+

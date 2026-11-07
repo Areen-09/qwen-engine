@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Qwen2.5-1.5B CUDA Engine</title>
+    <style>
+        :root {
+            --bg-primary: #0f1117;
+            --bg-secondary: #1a1d27;
+            --bg-tertiary: #232736;
+            --text-primary: #e6edf3;
+            --text-secondary: #8b949e;
+            --accent-color: #58a6ff;
+            --accent-hover: #1f6feb;
+            --border-color: #30363d;
+            --badge-bg: #21262d;
+            --user-bubble: #1f2937;
+            --bot-bubble: #1e293b;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        }
+
+        body {
+            background-color: var(--bg-primary);
+            color: var(--text-primary);
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        header {
+            background-color: var(--bg-secondary);
+            border-bottom: 1px solid var(--border-color);
+            padding: 12px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .header-title h1 {
+            font-size: 1.15rem;
+            font-weight: 600;
+            color: var(--accent-color);
+        }
+
+        .header-title p {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+
+        .telemetry-bar {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+        }
+
+        .badge {
+            background-color: var(--badge-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 4px 10px;
+            font-size: 0.78rem;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .badge-label {
+            color: var(--text-secondary);
+            font-size: 0.68rem;
+            text-transform: uppercase;
+        }
+
+        .badge-value {
+            font-weight: 600;
+            color: #3fb950;
+        }
+
+        .chat-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .message {
+            display: flex;
+            max-width: 80%;
+            padding: 12px 16px;
+            border-radius: 8px;
+            line-height: 1.5;
+            font-size: 0.95rem;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .message.user {
+            align-self: flex-end;
+            background-color: var(--user-bubble);
+            border: 1px solid #374151;
+            color: #f3f4f6;
+        }
+
+        .message.assistant {
+            align-self: flex-start;
+            background-color: var(--bot-bubble);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+        }
+
+        .message.system {
+            align-self: center;
+            background: transparent;
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            font-style: italic;
+        }
+
+        .input-bar {
+            background-color: var(--bg-secondary);
+            border-top: 1px solid var(--border-color);
+            padding: 16px 24px;
+            display: flex;
+            gap: 12px;
+            align-items: center;
+        }
+
+        textarea {
+            flex: 1;
+            background-color: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 10px 14px;
+            color: var(--text-primary);
+            resize: none;
+            height: 48px;
+            font-size: 0.95rem;
+            outline: none;
+        }
+
+        textarea:focus {
+            border-color: var(--accent-color);
+        }
+
+        button {
+            background-color: var(--accent-color);
+            color: #ffffff;
+            border: none;
+            border-radius: 6px;
+            padding: 10px 18px;
+            font-size: 0.9rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.15s ease;
+        }
+
+        button:hover {
+            background-color: var(--accent-hover);
+        }
+
+        button:disabled {
+            background-color: var(--border-color);
+            cursor: not-allowed;
+            color: var(--text-secondary);
+        }
+
+        .btn-secondary {
+            background-color: transparent;
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+        }
+
+        .btn-secondary:hover {
+            background-color: var(--badge-bg);
+            color: var(--text-primary);
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="header-title">
+            <h1>Qwen2.5-1.5B CUDA Engine</h1>
+            <p>Ampere sm_86 Custom Kernels | Zero Math Libs | Intel iGPU Rendering (0 MB dGPU VRAM)</p>
+        </div>
+        <div class="telemetry-bar">
+            <div class="badge">
+                <span class="badge-label">Mode</span>
+                <span class="badge-value" id="val-mode">W4A16</span>
+            </div>
+            <div class="badge">
+                <span class="badge-label">dGPU VRAM</span>
+                <span class="badge-value" id="val-vram">943 MB</span>
+            </div>
+            <div class="badge">
+                <span class="badge-label">Prefix Cache</span>
+                <span class="badge-value" id="val-prefix">0 tok</span>
+            </div>
+            <div class="badge">
+                <span class="badge-label">TTFT</span>
+                <span class="badge-value" id="val-ttft">0.0 ms</span>
+            </div>
+            <div class="badge">
+                <span class="badge-label">Decode Speed</span>
+                <span class="badge-value" id="val-tps">0.0 tok/s</span>
+            </div>
+            <button class="btn-secondary" id="btn-reset" title="Reset Session & Clear KV Cache">Reset</button>
+        </div>
+    </header>
+
+    <div class="chat-container" id="chat-box">
+        <div class="message system">Session ready. Multi-turn conversation history is cached in GPU KV memory.</div>
+    </div>
+
+    <div class="input-bar">
+        <textarea id="prompt-input" placeholder="Type a message... (Shift+Enter for newline, Enter to send)"></textarea>
+        <button id="btn-send">Send</button>
+    </div>
+
+    <script>
+        const chatBox = document.getElementById("chat-box");
+        const promptInput = document.getElementById("prompt-input");
+        const btnSend = document.getElementById("btn-send");
+        const btnReset = document.getElementById("btn-reset");
+
+        const valMode = document.getElementById("val-mode");
+        const valVram = document.getElementById("val-vram");
+        const valPrefix = document.getElementById("val-prefix");
+        const valTtft = document.getElementById("val-ttft");
+        const valTps = document.getElementById("val-tps");
+
+        let messages = [
+            { role: "system", content: "You are a helpful and concise assistant." }
+        ];
+        let isGenerating = false;
+
+        async function updateStats() {
+            try {
+                const res = await fetch("/api/stats");
+                if (res.ok) {
+                    const data = await res.json();
+                    valMode.textContent = data.mode;
+                    valVram.textContent = data.vram_used_mb.toFixed(1) + " MB";
+                    valPrefix.textContent = data.cached_tokens + " tok";
+                }
+            } catch (e) {}
+        }
+        updateStats();
+
+        btnReset.addEventListener("click", async () => {
+            if (isGenerating) return;
+            await fetch("/api/reset", { method: "POST" });
+            messages = [
+                { role: "system", content: "You are a helpful and concise assistant." }
+            ];
+            chatBox.innerHTML = '<div class="message system">Session reset. KV Cache cleared.</div>';
+            valPrefix.textContent = "0 tok";
+            valTtft.textContent = "0.0 ms";
+            valTps.textContent = "0.0 tok/s";
+        });
+
+        promptInput.addEventListener("keydown", (e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+
+        btnSend.addEventListener("click", sendMessage);
+
+        async function sendMessage() {
+            const text = promptInput.value.trim();
+            if (!text || isGenerating) return;
+
+            isGenerating = true;
+            btnSend.disabled = true;
+            promptInput.value = "";
+
+            // Add user message to UI
+            messages.push({ role: "user", content: text });
+            const userMsgEl = document.createElement("div");
+            userMsgEl.className = "message user";
+            userMsgEl.textContent = text;
+            chatBox.appendChild(userMsgEl);
+
+            // Add bot placeholder
+            const botMsgEl = document.createElement("div");
+            botMsgEl.className = "message assistant";
+            chatBox.appendChild(botMsgEl);
+            chatBox.scrollTop = chatBox.scrollHeight;
+
+            let botResponse = "";
+
+            try {
+                const response = await fetch("/api/chat", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        messages: messages,
+                        temperature: 0.0,
+                        max_new_tokens: 512
+                    })
+                });
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = "";
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split("\n\n");
+                    buffer = lines.pop(); // keep last incomplete chunk
+
+                    for (const line of lines) {
+                        if (line.startsWith("data: ")) {
+                            try {
+                                const payload = JSON.parse(line.slice(6));
+                                if (payload.token) {
+                                    botResponse += payload.token;
+                                    botMsgEl.textContent = botResponse;
+                                    chatBox.scrollTop = chatBox.scrollHeight;
+                                }
+                                if (payload.ttft_ms) {
+                                    valTtft.textContent = payload.ttft_ms.toFixed(1) + " ms";
+                                }
+                                if (payload.decode_tps) {
+                                    valTps.textContent = payload.decode_tps.toFixed(1) + " tok/s";
+                                }
+                                if (payload.cached_tokens) {
+                                    valPrefix.textContent = payload.cached_tokens + " tok";
+                                }
+                                if (payload.is_eos) {
+                                    break;
+                                }
+                            } catch (err) {}
+                        }
+                    }
+                }
+
+                messages.push({ role: "assistant", content: botResponse });
+            } catch (err) {
+                botMsgEl.textContent += "\n[Error: Failed to stream response]";
+            } finally {
+                isGenerating = false;
+                btnSend.disabled = false;
+                promptInput.focus();
+                updateStats();
+            }
+        }
+    </script>
+</body>
+</html>
+
