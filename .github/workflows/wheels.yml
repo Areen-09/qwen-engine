@@ -60,6 +60,7 @@ jobs:
         if: runner.os == 'Windows'
         env:
           CIBW_BUILD: ${{ matrix.cibw_build }}
+          CIBW_SKIP: "*-musllinux_*"
           CIBW_ARCHS: ${{ matrix.cibw_arch }}
           CIBW_ENVIRONMENT: >-
             CMAKE_CUDA_ARCHITECTURES="75;80;86;89;90;90-virtual"
@@ -73,6 +74,7 @@ jobs:
         if: runner.os == 'Linux'
         env:
           CIBW_BUILD: ${{ matrix.cibw_build }}
+          CIBW_SKIP: "*-musllinux_*"
           CIBW_ARCHS: ${{ matrix.cibw_arch }}
           CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
           CIBW_ENVIRONMENT: >-
