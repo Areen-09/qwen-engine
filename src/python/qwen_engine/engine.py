@@ -7,6 +7,7 @@ import os
 import asyncio
 from pathlib import Path
 from typing import Generator, AsyncGenerator, List, Dict, Union, Optional, Any
+from dataclasses import dataclass
 
 from . import _core
 from .exceptions import (
@@ -16,6 +17,15 @@ from .exceptions import (
     ContextWindowExceededError,
 )
 from .downloader import download
+
+
+@dataclass
+class SamplingParams:
+    """Sampling and decoding configuration parameters."""
+    temperature: float = 0.0
+    max_tokens: int = 256
+    top_p: float = 1.0
+    top_k: int = 50
 
 
 class Engine:
@@ -147,6 +157,7 @@ class Engine:
         prompt: Union[str, List[Dict[str, str]]],
         max_tokens: int = 256,
         temperature: float = 0.0,
+        sampling_params: Optional[SamplingParams] = None,
     ) -> str:
         """
         Run complete forward prefill and autoregressive decode, returning the text.
@@ -155,10 +166,14 @@ class Engine:
             prompt: Text prompt or list of ChatML messages (e.g. [{'role': 'user', 'content': '...'}]).
             max_tokens: Maximum number of new tokens to generate.
             temperature: Sampling temperature (0.0 = greedy argmax).
+            sampling_params: Optional SamplingParams object overriding max_tokens/temperature.
 
         Returns:
             Decoded completion string.
         """
+        if sampling_params is not None:
+            max_tokens = sampling_params.max_tokens
+            temperature = sampling_params.temperature
         if not self._engine.try_acquire_session():
             raise ConcurrencyError(
                 "Engine is already executing another inference session. "
@@ -192,6 +207,7 @@ class Engine:
         max_tokens: int = 256,
         temperature: float = 0.0,
         rollback_on_interrupt: bool = True,
+        sampling_params: Optional[SamplingParams] = None,
     ) -> Generator[str, None, None]:
         """
         Generate tokens as a streaming generator with multi-byte UTF-8 buffering.
@@ -205,10 +221,14 @@ class Engine:
             max_tokens: Maximum tokens to generate.
             temperature: Sampling temperature (0.0 = greedy).
             rollback_on_interrupt: Whether to roll back KV cache if stream is closed early.
+            sampling_params: Optional SamplingParams object overriding max_tokens/temperature.
 
         Yields:
             Decoded UTF-8 string fragments as tokens are generated.
         """
+        if sampling_params is not None:
+            max_tokens = sampling_params.max_tokens
+            temperature = sampling_params.temperature
         if not self._engine.try_acquire_session():
             raise ConcurrencyError(
                 "Engine is already executing another inference session. "
@@ -271,10 +291,14 @@ class Engine:
         max_tokens: int = 256,
         temperature: float = 0.0,
         rollback_on_interrupt: bool = True,
+        sampling_params: Optional[SamplingParams] = None,
     ) -> AsyncGenerator[str, None]:
         """
         Asynchronous generator interface wrapping the synchronous token stream in worker threads.
         """
+        if sampling_params is not None:
+            max_tokens = sampling_params.max_tokens
+            temperature = sampling_params.temperature
         gen = self.stream(
             prompt,
             max_tokens=max_tokens,
