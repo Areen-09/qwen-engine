@@ -1,5 +1,3 @@
-#ifdef _WIN32
-
 #include "communicator.cuh"
 #include "cuda_guard.cuh"
 #include <cuda_runtime.h>
@@ -29,7 +27,7 @@ __global__ void vector_add_kernel<half>(half* __restrict__ dst, const half* __re
     }
 }
 
-struct WinP2PSharedState {
+struct P2PSharedState {
     std::mutex mtx;
     std::condition_variable cv;
     int step_counter{0};
@@ -40,11 +38,11 @@ struct WinP2PSharedState {
     DataType current_type{DataType::FP16};
 };
 
-static WinP2PSharedState g_win_p2p_state;
+static P2PSharedState g_p2p_state;
 
-class WindowsP2PCommunicator : public ICommunicator {
+class P2PCommunicator : public ICommunicator {
 public:
-    WindowsP2PCommunicator(
+    P2PCommunicator(
         int rank,
         int world_size,
         const std::vector<int>& device_ids,
@@ -84,21 +82,21 @@ public:
             CUDA_CHECK(cudaMalloc(&d_peer_staging_, max_bytes));
             CUDA_CHECK(cudaEventCreateWithFlags(&local_event_, cudaEventDisableTiming));
 
-            std::unique_lock<std::mutex> lock(g_win_p2p_state.mtx);
-            g_win_p2p_state.device_peer_buf[rank_] = d_peer_staging_;
-            g_win_p2p_state.peer_events[rank_] = local_event_;
-            std::cout << "[WindowsP2PCommunicator] Rank " << rank_
-                      << " enabled direct BAR1 P2P with device " << peer_dev << " (TCC mode)." << std::endl;
+            std::unique_lock<std::mutex> lock(g_p2p_state.mtx);
+            g_p2p_state.device_peer_buf[rank_] = d_peer_staging_;
+            g_p2p_state.peer_events[rank_] = local_event_;
+            std::cout << "[P2PCommunicator] Rank " << rank_
+                      << " enabled direct BAR1 P2P with device " << peer_dev << "." << std::endl;
         } else {
             CUDA_CHECK(cudaHostAlloc(&h_host_staging_, max_bytes, cudaHostAllocMapped));
-            std::unique_lock<std::mutex> lock(g_win_p2p_state.mtx);
-            g_win_p2p_state.host_staging[rank_] = h_host_staging_;
-            std::cout << "[WindowsP2PCommunicator] Rank " << rank_
-                      << " fallback to double-buffered host staging (WDDM mode)." << std::endl;
+            std::unique_lock<std::mutex> lock(g_p2p_state.mtx);
+            g_p2p_state.host_staging[rank_] = h_host_staging_;
+            std::cout << "[P2PCommunicator] Rank " << rank_
+                      << " fallback to double-buffered host staging." << std::endl;
         }
     }
 
-    ~WindowsP2PCommunicator() override {
+    ~P2PCommunicator() override {
         if (world_size_ <= 1) return;
 
         CudaDeviceGuard guard(device_ids_[rank_]);
@@ -126,8 +124,8 @@ public:
         if (peer_accessible_) {
             // Direct P2P All-Reduce path (CUDA Graph capture compatible)
             int peer_rank = 1 - rank_;
-            void* peer_staging = g_win_p2p_state.device_peer_buf[peer_rank];
-            cudaEvent_t peer_event = g_win_p2p_state.peer_events[peer_rank];
+            void* peer_staging = g_p2p_state.device_peer_buf[peer_rank];
+            cudaEvent_t peer_event = g_p2p_state.peer_events[peer_rank];
 
             // 1. Copy local buffer into peer's staging buffer across PCIe BAR1
             CUDA_CHECK(cudaMemcpyPeerAsync(peer_staging, device_ids_[peer_rank],
@@ -163,26 +161,26 @@ public:
                 );
             }
         } else {
-            // WDDM Host-pinned staging buffer fallback (host synchronized)
+            // Host-pinned staging buffer fallback (host synchronized)
             CUDA_CHECK(cudaMemcpyAsync(h_host_staging_, sendrecvbuf, bytes, cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
 
             // Host rendezvous barrier
             {
-                std::unique_lock<std::mutex> lock(g_win_p2p_state.mtx);
-                int cur_step = g_win_p2p_state.step_counter;
-                g_win_p2p_state.current_count = count;
-                g_win_p2p_state.current_type = type;
+                std::unique_lock<std::mutex> lock(g_p2p_state.mtx);
+                int cur_step = g_p2p_state.step_counter;
+                g_p2p_state.current_count = count;
+                g_p2p_state.current_type = type;
 
                 if (rank_ == 0) {
-                    g_win_p2p_state.step_counter++;
-                    g_win_p2p_state.cv.wait(lock, [&]() {
-                        return g_win_p2p_state.step_counter == cur_step + 2;
+                    g_p2p_state.step_counter++;
+                    g_p2p_state.cv.wait(lock, [&]() {
+                        return g_p2p_state.step_counter == cur_step + 2;
                     });
                 } else {
                     // Rank 1 performs the summation in host memory
-                    void* h0 = g_win_p2p_state.host_staging[0];
-                    void* h1 = g_win_p2p_state.host_staging[1];
+                    void* h0 = g_p2p_state.host_staging[0];
+                    void* h1 = g_p2p_state.host_staging[1];
 
                     if (type == DataType::FP16) {
                         half* h0_ptr = reinterpret_cast<half*>(h0);
@@ -201,8 +199,8 @@ public:
                             h1_ptr[i] = s;
                         }
                     }
-                    g_win_p2p_state.step_counter++;
-                    g_win_p2p_state.cv.notify_all();
+                    g_p2p_state.step_counter++;
+                    g_p2p_state.cv.notify_all();
                 }
             }
 
@@ -236,10 +234,8 @@ std::unique_ptr<ICommunicator> create_communicator(
     const std::vector<int>& device_ids,
     bool force_staging
 ) {
-    return std::make_unique<WindowsP2PCommunicator>(rank, world_size, device_ids, force_staging);
+    return std::make_unique<P2PCommunicator>(rank, world_size, device_ids, force_staging);
 }
 
 } // namespace qwen
-
-#endif // _WIN32
 

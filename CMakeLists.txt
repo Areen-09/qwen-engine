@@ -58,12 +58,18 @@ include_directories(
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 
-if(NOT WIN32)
+option(ENABLE_NCCL "Build with NCCL backend on Linux" OFF)
+
+if(ENABLE_NCCL AND NOT WIN32)
     find_path(NCCL_INCLUDE_DIR NAMES nccl.h PATHS /usr/local/include /usr/include)
     find_library(NCCL_LIBRARY NAMES nccl PATHS /usr/local/lib /usr/lib)
     if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
         message(STATUS "Found NCCL: ${NCCL_LIBRARY}")
         include_directories(${NCCL_INCLUDE_DIR})
+        add_compile_definitions(QWEN_ENABLE_NCCL)
+    else()
+        message(WARNING "NCCL not found, falling back to zero-dependency P2P communicator")
+        set(ENABLE_NCCL OFF)
     endif()
 endif()
 
@@ -79,10 +85,10 @@ set(CORE_SOURCES
     src/tokenizer.cpp
 )
 
-if(WIN32)
-    list(APPEND CORE_SOURCES src/communicator_win_p2p.cu)
-else()
+if(ENABLE_NCCL)
     list(APPEND CORE_SOURCES src/communicator_nccl.cu)
+else()
+    list(APPEND CORE_SOURCES src/communicator_p2p.cu)
 endif()
 
 add_library(qwen_core STATIC ${CORE_SOURCES})
@@ -91,7 +97,7 @@ set_target_properties(qwen_core PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 set_target_properties(qwen_core PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 target_link_libraries(qwen_core PUBLIC CUDA::cudart_static)
 
-if(NOT WIN32 AND NCCL_LIBRARY)
+if(ENABLE_NCCL AND NCCL_LIBRARY)
     target_link_libraries(qwen_core PUBLIC ${NCCL_LIBRARY})
 endif()
 

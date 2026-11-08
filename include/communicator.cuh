@@ -29,7 +29,7 @@ public:
     virtual bool is_peer_accessible() const = 0;
 };
 
-// Factory producing platform-specific communicator backend (Windows P2P / Linux NCCL)
+// Factory producing communicator backend (Zero-dependency Direct P2P or optional Linux NCCL)
 std::unique_ptr<ICommunicator> create_communicator(
     int rank,
     int world_size,

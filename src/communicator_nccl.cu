@@ -1,4 +1,4 @@
-#ifndef _WIN32
+#if defined(QWEN_ENABLE_NCCL)
 
 #include "communicator.cuh"
 #include <nccl.h>
@@ -79,5 +79,5 @@ std::unique_ptr<ICommunicator> create_communicator(
 
 } // namespace qwen
 
-#endif // !_WIN32
+#endif // QWEN_ENABLE_NCCL
 

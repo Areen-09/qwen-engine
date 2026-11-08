@@ -567,7 +567,7 @@ The implementation proceeds in four sequential phases, structured to eliminate t
 | Phase 4: Cross-Platform 2-Way Tensor Parallelism                        |
 |  - Implement include/communicator.cuh (ICommunicator & DataType)        |
 |  - Implement src/communicator_nccl.cu (Linux SPMD backend)              |
-|  - Implement src/communicator_win_p2p.cu (TCC direct P2P / WDDM staging)|
+|  - Implement src/communicator_p2p.cu (cross-platform zero-dependency direct BAR1 P2P / host staging)|
 |  - Establish worker thread pool in QwenEngine for multi-device execution|
 |  - Validate 2-way TP Qwen 3.8-27B on 2x Tesla T4 16GB GPUs             |
 +-------------------------------------------------------------------------+
@@ -648,7 +648,7 @@ The implementation proceeds in four sequential phases, structured to eliminate t
 * **Changes**: Implement `NcclCommunicator` wrapping `ncclCommInitRank` and `ncclAllReduce` using `ncclSum`. Guard entire file with `#ifndef _WIN32`.
 * **Rationale**: Provides NCCL-backed All-Reduce operations across PCIe and NVLink on Linux platforms.
 
-#### 12. `src/communicator_win_p2p.cu` (Create)
+#### 12. `src/communicator_p2p.cu` (Create)
 * **Scope**: CUDA C++ Source (Windows P2P Backend)
 * **Changes**: Implement `WindowsP2PCommunicator`. Check `cudaDeviceCanAccessPeer`. In TCC mode, enable peer access and execute direct BAR1 writes with cross-stream CUDA event synchronization (`cudaEventRecord`/`cudaStreamWaitEvent`). In WDDM mode, allocate double-buffered pinned host buffers (`cudaHostAlloc`) and execute staging copies. Guard entire file with `#ifdef _WIN32`.
 * **Rationale**: Native multi-GPU tensor parallelism on Windows without external NCCL libraries.
@@ -673,7 +673,7 @@ The implementation proceeds in four sequential phases, structured to eliminate t
 
 #### 16. `CMakeLists.txt` (Modify)
 * **Scope**: CMake Build Configuration
-* **Changes**: Add custom NCCL discovery block (`find_path(NCCL_INCLUDE_DIR nccl.h)`, `find_library(NCCL_LIBRARY nccl)`) on Linux. Conditionally compile `communicator_nccl.cu` on Linux or `communicator_win_p2p.cu` on Windows. Add `target_link_libraries(qwen_core PUBLIC ${NCCL_LIBRARY})` and `target_include_directories(qwen_core PUBLIC ${NCCL_INCLUDE_DIR})` to ensure downstream executable targets link NCCL symbols on Linux. Add `deltanet_sm75.cu` to target sources.
+* **Changes**: Add custom NCCL discovery block (`find_path(NCCL_INCLUDE_DIR nccl.h)`, `find_library(NCCL_LIBRARY nccl)`) on Linux with `ENABLE_NCCL` option. Default to zero-dependency `communicator_p2p.cu` across platforms for standalone wheels, or `communicator_nccl.cu` when `ENABLE_NCCL` is requested. Add `target_link_libraries(qwen_core PUBLIC ${NCCL_LIBRARY})` when NCCL is enabled. Add `deltanet_sm75.cu` to target sources.
 * **Rationale**: Configures cross-platform compilation and clean downstream linkage across MSVC and GCC/Clang.
 
 #### 17. `tests/test_dynamic_engine.py` (Create)
