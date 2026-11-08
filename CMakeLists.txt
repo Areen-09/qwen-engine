@@ -58,6 +58,15 @@ include_directories(
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 
+if(NOT WIN32)
+    find_path(NCCL_INCLUDE_DIR NAMES nccl.h PATHS /usr/local/include /usr/include)
+    find_library(NCCL_LIBRARY NAMES nccl PATHS /usr/local/lib /usr/lib)
+    if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
+        message(STATUS "Found NCCL: ${NCCL_LIBRARY}")
+        include_directories(${NCCL_INCLUDE_DIR})
+    endif()
+endif()
+
 set(CORE_SOURCES
     src/kernels/rmsnorm_rope.cu
     src/kernels/gemv_fp16.cu
@@ -65,15 +74,26 @@ set(CORE_SOURCES
     src/kernels/gemm_prefill.cu
     src/kernels/attention_gqa.cu
     src/kernels/sampling.cu
+    src/kernels/deltanet_sm75.cu
     src/engine.cu
     src/tokenizer.cpp
 )
+
+if(WIN32)
+    list(APPEND CORE_SOURCES src/communicator_win_p2p.cu)
+else()
+    list(APPEND CORE_SOURCES src/communicator_nccl.cu)
+endif()
 
 add_library(qwen_core STATIC ${CORE_SOURCES})
 set_target_properties(qwen_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 set_target_properties(qwen_core PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 set_target_properties(qwen_core PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 target_link_libraries(qwen_core PUBLIC CUDA::cudart_static)
+
+if(NOT WIN32 AND NCCL_LIBRARY)
+    target_link_libraries(qwen_core PUBLIC ${NCCL_LIBRARY})
+endif()
 
 # Nanobind Python Bindings Target
 option(BUILD_PYTHON_BINDINGS "Build nanobind Python bindings" ON)

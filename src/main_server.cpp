@@ -281,7 +281,7 @@ int main(int argc, char** argv) {
             auto t_gen_start = std::chrono::steady_clock::now();
             int gen_count = 1;
 
-            while (!QwenTokenizer::is_eos(prev_token) && gen_count < max_new_tokens && engine.current_seq_pos() < MAX_SEQ_LEN) {
+            while (!QwenTokenizer::is_eos(prev_token) && gen_count < max_new_tokens && engine.current_seq_pos() < engine.config().max_seq_len()) {
                 // Next step
                 int32_t curr_token = engine.decode_step();
                 gen_count++;

@@ -14,7 +14,10 @@ The compiled Python extension statically bundles the CUDA runtime (`CUDA::cudart
 
 ## Key Highlights
 
-- **Zero Math Runtime Dependencies:** Handcrafted CUDA kernels for RMSNorm, RoPE, Grouped-Query Attention (GQA), W4A16 GEMV, SwiGLU, and fused device sampling.
+- **Zero Math Runtime Dependencies:** Handcrafted CUDA kernels for RMSNorm, RoPE, Grouped-Query Attention (GQA), Gated DeltaNet linear attention, W4A16 GEMV, SwiGLU, and fused device sampling.
+- **Unified Hybrid Architecture (DeltaNet + GQA):** Native support for hybrid models alternating GQA attention and fused Gated DeltaNet sm_75 linear recurrence. Selective KV cache allocation cuts VRAM requirements by up to 75% on recurrent layers.
+- **Cross-Platform Tensor Parallelism:** High-performance 2-way TP engine with zero external communication dependencies. Uses direct BAR1 P2P with CUDA event sync on Windows (with double-buffered staging fallback under WDDM) and NCCL on Linux.
+- **Universal GGUF & HuggingFace Importer:** Direct ingestion from standard GGUF v2/v3 or PyTorch safetensors with on-the-fly warp-interleaved W4A16 quantization and dynamic `.qwenbin` v2 serialization.
 - **Ultra-Low Memory Footprint (<1 GB VRAM):**
   - **W4A16 (Group 128):** ~943 MB total discrete VRAM for weights, activations, and KV cache. Runs comfortably on 4 GB laptop GPUs (e.g. RTX 3050).
   - **FP16 Baseline:** ~3,234 MB total discrete VRAM.

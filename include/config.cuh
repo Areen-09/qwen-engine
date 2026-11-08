@@ -2,10 +2,11 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <vector>
 
 namespace qwen {
 
-// Architectural compile-time dimensions for Qwen2.5-1.5B
+// Architectural compile-time dimensions for Qwen2.5-1.5B (backward compatibility defaults)
 constexpr int32_t NUM_LAYERS          = 28;
 constexpr int32_t HIDDEN_SIZE         = 1536;
 constexpr int32_t INTERMEDIATE_SIZE   = 8960;
@@ -46,7 +47,7 @@ enum class QuantMode : uint32_t {
     W4A16_G128 = 1
 };
 
-// Layer weight tensor indices in layer_offsets[28][17]
+// Layer weight tensor indices in layer_offsets[28][17] for v1 legacy containers
 namespace LayerTensorIdx {
     constexpr int INPUT_LAYERNORM          = 0;
     constexpr int Q_WEIGHT                 = 1;
@@ -68,7 +69,7 @@ namespace LayerTensorIdx {
     constexpr int COUNT                    = 17;
 }
 
-// 4096-byte page-aligned header for .qwenbin weight format
+// 4096-byte page-aligned header for legacy .qwenbin v1 weight format
 struct alignas(4096) QWQwenHeader {
     uint32_t magic;               // 0x5157454E ("QWEN")
     uint32_t version;             // 1
@@ -93,6 +94,117 @@ struct alignas(4096) QWQwenHeader {
 };
 static_assert(sizeof(QWQwenHeader) == 4096, "QWQwenHeader must be exactly 4096 bytes");
 
+// ----------------------------------------------------------------------------
+// .qwenbin v2 Self-Describing Container Specification
+// ----------------------------------------------------------------------------
+
+enum LayerType : uint32_t {
+    LAYER_GQA = 0,       // Standard Grouped Query Attention
+    LAYER_DELTANET = 1   // Gated DeltaNet Linear Attention
+};
+
+struct alignas(64) QwenBinHeaderV2 {
+    uint32_t magic;                 // 0x5157454E ("QWEN")
+    uint32_t version;               // 2
+    uint32_t hidden_size;           // Hidden dimension (e.g. 1536, 2560, 5120)
+    uint32_t intermediate_size;     // MLP intermediate dimension
+    uint32_t num_layers;            // Total layer count
+    uint32_t num_attention_heads;   // Attention query heads
+    uint32_t num_kv_heads;          // Key/Value heads
+    uint32_t head_dim;              // Head dimension (typically 128)
+    uint32_t vocab_size;            // Vocabulary size (e.g. 151936)
+    uint32_t max_seq_len;           // Context window ceiling
+    uint32_t quant_type;            // 0 = FP16, 1 = W4A16_G128
+    uint32_t tie_word_embeddings;   // 1 if lm_head shares embed_tokens, else 0
+    float    rms_norm_eps;          // Normalization epsilon (e.g. 1e-6)
+    float    rope_theta;            // RoPE base frequency (e.g. 1000000.0)
+    uint32_t reserved_flags;        // Alignment padding
+    uint32_t padding0;              // Explicit 4-byte padding ensuring 8-byte alignment
+
+    // 64-bit File Offsets
+    uint64_t layer_table_offset;    // Byte offset to LayerDescriptor array
+    uint64_t embed_tokens_offset;   // Byte offset to input embedding table
+    uint64_t final_norm_offset;     // Byte offset to final RMSNorm weights
+    uint64_t lm_head_offset;        // Byte offset to output unembedding weights
+    uint64_t weights_offset;        // Byte offset to aligned layer weight payload
+    uint64_t reserved[6];           // reserved[0] = embed_scale_offset, reserved[1..5] = headroom
+};
+
+struct alignas(8) LayerDescriptor {
+    uint32_t type;                  // Execution tag (LAYER_GQA or LAYER_DELTANET)
+    uint32_t reserved;              // Struct padding ensuring 8-byte alignment
+
+    // Common Normalization Offsets
+    uint64_t norm1_weight_offset;   // Pre-attention / Pre-DeltaNet RMSNorm
+    uint64_t norm2_weight_offset;   // Pre-MLP RMSNorm
+
+    // GQA Specific Offsets (Valid when type == LAYER_GQA)
+    uint64_t qkv_weight_offset;     // Fused or Q projection weights
+    uint64_t q_bias_offset;         // Q attention bias
+    uint64_t k_bias_offset;         // K attention bias
+    uint64_t v_bias_offset;         // V attention bias
+    uint64_t attn_out_weight_offset;// Attention output projection
+
+    // DeltaNet Specific Offsets (Valid when type == LAYER_DELTANET)
+    uint64_t conv1d_weight_offset;  // Depthwise 1D convolution weights
+    uint64_t conv1d_bias_offset;    // Depthwise 1D convolution bias
+    uint64_t in_proj_weight_offset; // Input projection (Q, K, V, Z gates)
+    uint64_t decay_weight_offset;   // Decay projection weights (beta gate)
+    uint64_t delta_out_weight_offset;// DeltaNet output projection
+
+    // MLP Offsets
+    uint64_t mlp_gate_offset;       // SwiGLU gate projection
+    uint64_t mlp_up_offset;         // SwiGLU up projection
+    uint64_t mlp_down_offset;       // SwiGLU down projection
+
+    // Quantization Offsets (Valid when quant_type == W4A16_G128)
+    uint64_t quant_scales_offset;   // FP16 scaling factors
+    uint64_t quant_zeros_offset;    // Zero points (or 0 for symmetric quantization)
+
+    // Sub-tensor and per-projection offsets
+    uint64_t k_weight_offset;
+    uint64_t v_weight_offset;
+    uint64_t q_scale_offset;
+    uint64_t k_scale_offset;
+    uint64_t v_scale_offset;
+    uint64_t attn_out_scale_offset;
+    uint64_t mlp_gate_scale_offset;
+    uint64_t mlp_up_scale_offset;
+    uint64_t mlp_down_scale_offset;
+};
+static_assert(sizeof(LayerDescriptor) == 216, "LayerDescriptor must be exactly 216 bytes");
+
+class ModelConfig {
+public:
+    ModelConfig() : header_{}, layers_{} {}
+
+    explicit ModelConfig(const QwenBinHeaderV2& header, const LayerDescriptor* layers)
+        : header_(header), layers_(layers, layers + header.num_layers) {}
+
+    // Model Dimensions
+    int32_t hidden_size() const { return static_cast<int32_t>(header_.hidden_size); }
+    int32_t intermediate_size() const { return static_cast<int32_t>(header_.intermediate_size); }
+    int32_t num_layers() const { return static_cast<int32_t>(header_.num_layers); }
+    int32_t num_attention_heads() const { return static_cast<int32_t>(header_.num_attention_heads); }
+    int32_t num_kv_heads() const { return static_cast<int32_t>(header_.num_kv_heads); }
+    int32_t head_dim() const { return static_cast<int32_t>(header_.head_dim); }
+    int32_t vocab_size() const { return static_cast<int32_t>(header_.vocab_size); }
+    int32_t max_seq_len() const { return static_cast<int32_t>(header_.max_seq_len); }
+    uint32_t quant_type() const { return header_.quant_type; }
+    bool tie_word_embeddings() const { return header_.tie_word_embeddings != 0; }
+    float rms_norm_eps() const { return header_.rms_norm_eps; }
+    float rope_theta() const { return header_.rope_theta; }
+
+    // Layer Descriptors & Offsets
+    const LayerDescriptor& layer(size_t idx) const { return layers_.at(idx); }
+    const QwenBinHeaderV2& header() const { return header_; }
+    const std::vector<LayerDescriptor>& layers() const { return layers_; }
+
+private:
+    QwenBinHeaderV2 header_;
+    std::vector<LayerDescriptor> layers_;
+};
+
 // Binary tokenizer header for tokenizer.bin
 struct TokenizerBinHeader {
     uint32_t magic;       // 0x51544F4B ("QTOK")
@@ -113,4 +225,3 @@ struct alignas(256) GoldenRefHeader {
 static_assert(sizeof(GoldenRefHeader) == 512, "GoldenRefHeader must be 512 bytes");
 
 } // namespace qwen
-

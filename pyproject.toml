@@ -4,8 +4,8 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "qwen-engine"
-version = "0.1.0"
-description = "Bare-metal zero-dependency C++20/CUDA inference engine for Qwen2.5-1.5B"
+version = "0.2.0"
+description = "Bare-metal zero-dependency C++20/CUDA inference engine for Qwen with unified hybrid attention and tensor parallelism"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [

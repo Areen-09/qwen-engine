@@ -148,9 +148,19 @@ NB_MODULE(_core, m) {
         .def_rw("role", &qwen::ChatMessage::role)
         .def_rw("content", &qwen::ChatMessage::content);
 
+    m.def("cuda_device_count", []() {
+        int count = 0;
+        cudaError_t err = cudaGetDeviceCount(&count);
+        if (err != cudaSuccess) return 0;
+        return count;
+    });
+
     // NativeTokenizer
     auto tok_cls = nb::class_<qwen::QwenTokenizer>(m, "NativeTokenizer");
     tok_cls.def(nb::init<const std::string&>(), "tokenizer_bin_path"_a);
+    tok_cls.def_static("from_bytes", [](const nb::bytes& b) {
+        return std::make_unique<qwen::QwenTokenizer>(b.data(), b.size());
+    }, "buffer"_a);
     tok_cls.def("encode", &qwen::QwenTokenizer::encode, "text"_a);
     tok_cls.def("decode", &qwen::QwenTokenizer::decode, "tokens"_a);
     tok_cls.def("decode_token", &qwen::QwenTokenizer::decode_token, "token_id"_a);
@@ -190,6 +200,7 @@ NB_MODULE(_core, m) {
     // NativeEngine
     nb::class_<qwen::QwenEngine>(m, "NativeEngine")
         .def(nb::init<const std::string&, int>(), "qwenbin_path"_a, "device_id"_a = 0)
+        .def(nb::init<const std::string&, const std::vector<int>&>(), "model_path"_a, "device_ids"_a)
         .def("prefill", [](qwen::QwenEngine& self, const std::vector<int32_t>& tokens, float temp) {
             nb::gil_scoped_release release;
             return self.prefill(tokens, temp);
@@ -202,6 +213,8 @@ NB_MODULE(_core, m) {
         .def("reset_session", &qwen::QwenEngine::reset_session)
         .def("get_memory_stats", &qwen::QwenEngine::get_memory_stats)
         .def("device_id", &qwen::QwenEngine::device_id)
+        .def("num_gqa_layers", &qwen::QwenEngine::num_gqa_layers)
+        .def("num_deltanet_layers", &qwen::QwenEngine::num_deltanet_layers)
         .def("current_seq_pos", &qwen::QwenEngine::current_seq_pos)
         .def("current_token_id", &qwen::QwenEngine::current_token_id)
         .def("try_acquire_session", &qwen::QwenEngine::try_acquire_session)

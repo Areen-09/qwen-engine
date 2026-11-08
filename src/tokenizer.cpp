@@ -10,6 +10,62 @@ QwenTokenizer::QwenTokenizer(const std::string& tokenizer_bin_path) {
     load_tokenizer_bin(tokenizer_bin_path);
 }
 
+QwenTokenizer::QwenTokenizer(const void* buffer, size_t size) {
+    load_tokenizer_buffer(buffer, size);
+}
+
+void QwenTokenizer::load_tokenizer_buffer(const void* buffer, size_t size) {
+    if (!buffer || size < sizeof(TokenizerBinHeader)) {
+        throw std::runtime_error("QwenTokenizer: Invalid tokenizer memory buffer");
+    }
+
+    const uint8_t* ptr = static_cast<const uint8_t*>(buffer);
+    const uint8_t* end = ptr + size;
+
+    const TokenizerBinHeader* header = reinterpret_cast<const TokenizerBinHeader*>(ptr);
+    if (header->magic != 0x51544F4B) {
+        throw std::runtime_error("QwenTokenizer: Invalid magic number in memory buffer");
+    }
+    ptr += sizeof(TokenizerBinHeader);
+
+    vocab_pieces_.resize(header->vocab_size);
+    for (uint32_t i = 0; i < header->vocab_size; ++i) {
+        if (ptr + sizeof(uint16_t) > end) {
+            throw std::runtime_error("QwenTokenizer: Unexpected end of buffer reading piece length");
+        }
+        uint16_t byte_len = *reinterpret_cast<const uint16_t*>(ptr);
+        ptr += sizeof(uint16_t);
+
+        if (ptr + byte_len > end) {
+            throw std::runtime_error("QwenTokenizer: Unexpected end of buffer reading piece data");
+        }
+        std::string piece(reinterpret_cast<const char*>(ptr), byte_len);
+        ptr += byte_len;
+
+        if (ptr + sizeof(int32_t) > end) {
+            throw std::runtime_error("QwenTokenizer: Unexpected end of buffer reading rank");
+        }
+        ptr += sizeof(int32_t); // rank
+
+        vocab_pieces_[i] = piece;
+        piece_to_id_[piece] = static_cast<int32_t>(i);
+    }
+
+    for (uint32_t m = 0; m < header->num_merges; ++m) {
+        if (ptr + 3 * sizeof(int32_t) > end) {
+            throw std::runtime_error("QwenTokenizer: Unexpected end of buffer reading merge pair");
+        }
+        int32_t left = *reinterpret_cast<const int32_t*>(ptr);
+        int32_t right = *reinterpret_cast<const int32_t*>(ptr + sizeof(int32_t));
+        int32_t merged = *reinterpret_cast<const int32_t*>(ptr + 2 * sizeof(int32_t));
+        ptr += 3 * sizeof(int32_t);
+
+        auto pair = std::make_pair(left, right);
+        merges_[pair] = merged;
+        merge_ranks_[pair] = static_cast<int32_t>(m);
+    }
+}
+
 void QwenTokenizer::load_tokenizer_bin(const std::string& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) {

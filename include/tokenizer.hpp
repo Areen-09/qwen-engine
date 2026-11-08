@@ -16,6 +16,7 @@ struct ChatMessage {
 class QwenTokenizer {
 public:
     explicit QwenTokenizer(const std::string& tokenizer_bin_path);
+    explicit QwenTokenizer(const void* buffer, size_t size);
 
     std::vector<int32_t> encode(const std::string& text) const;
     std::string decode(const std::vector<int32_t>& tokens) const;
@@ -35,6 +36,7 @@ public:
 
 private:
     void load_tokenizer_bin(const std::string& path);
+    void load_tokenizer_buffer(const void* buffer, size_t size);
 
     // BPE piece table
     std::vector<std::string> vocab_pieces_;
@@ -51,4 +53,3 @@ private:
 };
 
 } // namespace qwen
-

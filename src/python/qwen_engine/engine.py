@@ -41,15 +41,17 @@ class Engine:
         model_path: Union[str, Path],
         tokenizer_path: Optional[Union[str, Path]] = None,
         device_id: int = 0,
+        device_ids: Optional[Union[int, List[int]]] = None,
     ) -> None:
         """
-        Initialize the inference engine on the designated GPU.
+        Initialize the inference engine on the designated GPU(s).
 
         Args:
             model_path: Path to the quantized .qwenbin weight binary.
             tokenizer_path: Path to the binary tokenizer.bin. If None,
                 searches adjacent to model_path or in standard paths.
             device_id: Target CUDA device ID (default: 0).
+            device_ids: Optional list of target CUDA device IDs for multi-GPU execution.
         """
         model_p = Path(model_path).resolve()
         if not model_p.is_file():
@@ -75,10 +77,28 @@ class Engine:
 
         self._model_path = str(model_p)
         self._tokenizer_path = str(tokenizer_p)
-        self._device_id = device_id
+
+        # Resolve device IDs
+        if device_ids is not None:
+            if isinstance(device_ids, int):
+                self._device_ids = [device_ids]
+            else:
+                self._device_ids = list(device_ids)
+        else:
+            self._device_ids = [device_id]
+
+        available_devices = _core.cuda_device_count()
+        for d in self._device_ids:
+            if d < 0 or (available_devices > 0 and d >= available_devices):
+                raise ValueError(f"Invalid CUDA device ID {d}; available devices: {available_devices}")
+
+        self._device_id = self._device_ids[0]
 
         self._tokenizer = _core.NativeTokenizer(self._tokenizer_path)
-        self._engine = _core.NativeEngine(self._model_path, self._device_id)
+        if len(self._device_ids) > 1:
+            self._engine = _core.NativeEngine(self._model_path, self._device_ids)
+        else:
+            self._engine = _core.NativeEngine(self._model_path, self._device_id)
 
     @classmethod
     def from_pretrained(
@@ -86,6 +106,7 @@ class Engine:
         model_id_or_path: Optional[Union[str, Path]] = None,
         tokenizer_path: Optional[Union[str, Path]] = None,
         device_id: int = 0,
+        device_ids: Optional[Union[int, List[int]]] = None,
         cache_dir: Optional[Union[str, Path]] = None,
         model_path: Optional[Union[str, Path]] = None,
         **kwargs,
@@ -99,6 +120,7 @@ class Engine:
                 Hugging Face repo ID, or local file/directory path.
             tokenizer_path: Path to the binary tokenizer.bin.
             device_id: Target GPU device ID (default: 0).
+            device_ids: Optional list of target CUDA device IDs for multi-GPU execution.
             cache_dir: Custom directory to store downloaded models.
             model_path: Alias for model_id_or_path.
         """
@@ -108,11 +130,11 @@ class Engine:
 
         target_p = Path(target_model)
         if target_p.is_file():
-            return cls(model_path=target_p, tokenizer_path=tokenizer_path, device_id=device_id)
+            return cls(model_path=target_p, tokenizer_path=tokenizer_path, device_id=device_id, device_ids=device_ids)
 
         resolved_model, resolved_tok = download(str(target_model), cache_dir=cache_dir)
         actual_tok = tokenizer_path or resolved_tok
-        return cls(model_path=resolved_model, tokenizer_path=actual_tok, device_id=device_id)
+        return cls(model_path=resolved_model, tokenizer_path=actual_tok, device_id=device_id, device_ids=device_ids)
 
     @property
     def device_id(self) -> int:

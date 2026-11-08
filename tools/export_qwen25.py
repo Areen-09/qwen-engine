@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Offline Model Exporter & Group-128 Quantizer for Qwen2.5-1.5B
-Generates page-aligned .qwenbin weight files and binary tokenizer.bin
+Offline Model Exporter & Group-128 Quantizer for Qwen2.5
+Generates .qwenbin v2 container files and binary tokenizer.bin
+Supports arbitrary model sizes and configurations from HuggingFace.
 """
 
 import argparse
@@ -13,16 +14,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen2Config, Qwen2
 
 MAGIC_QWEN = 0x5157454E  # "QWEN"
 MAGIC_QTOK = 0x51544F4B  # "QTOK"
-FORMAT_VERSION = 1
-
-NUM_LAYERS = 28
-HIDDEN_SIZE = 1536
-INTERMEDIATE_SIZE = 8960
-NUM_Q_HEADS = 12
-NUM_KV_HEADS = 2
-HEAD_DIM = 128
-VOCAB_SIZE = 151936
 QUANT_GROUP_SIZE = 128
+
+LAYER_GQA = 0
+LAYER_DELTANET = 1
 
 class LayerTensorIdx:
     INPUT_LAYERNORM          = 0
@@ -64,7 +59,6 @@ def quantize_and_pack_w4a16(weight_matrix: np.ndarray):
     q = np.clip(np.round(w_grouped / scales_f32) + 8.0, 0, 15).astype(np.uint32)
 
     # Fast vectorized nibble packing
-    # q is [N, num_groups_per_row, 16, 8]
     q_sub = q.reshape(N, num_groups_per_row, 16, 8)
     q0 = q_sub[..., 0]
     q1 = q_sub[..., 1]
@@ -76,7 +70,6 @@ def quantize_and_pack_w4a16(weight_matrix: np.ndarray):
     q7 = q_sub[..., 7]
 
     w32 = (q0) | (q4 << 4) | (q1 << 8) | (q5 << 12) | (q2 << 16) | (q6 << 20) | (q3 << 24) | (q7 << 28)
-    # w32 is [N, num_groups_per_row, 16]
 
     # Interleave group 2*s (lanes 0..15) and group 2*s + 1 (lanes 16..31)
     w32_paired = w32.reshape(N, num_warp_steps, 2, 16)
@@ -108,7 +101,6 @@ def export_tokenizer(tokenizer, output_path):
         f.write(header)
 
         for piece_str, token_id in sorted_vocab:
-            # Decode to real text representation (e.g. 'Ġworld' -> ' world')
             decoded_text = tokenizer.convert_tokens_to_string([piece_str])
             piece_bytes = decoded_text.encode("utf-8", errors="replace")
             f.write(struct.pack("<H", len(piece_bytes)))
@@ -120,10 +112,9 @@ def export_tokenizer(tokenizer, output_path):
 
     print(f"[Exporter] Serialized {vocab_size} tokens and {len(merges)} merges.")
 
-def export_dummy_tokenizer(output_path):
+def export_dummy_tokenizer(output_path, vocab_size=151646):
     print(f"[Exporter] Generating offline synthetic tokenizer at {output_path}...")
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    vocab_size = 151646
     with open(output_path, "wb") as f:
         header = struct.pack("<IIII", MAGIC_QTOK, vocab_size, 0, 151645)
         f.write(header)
@@ -144,27 +135,39 @@ def export_dummy_tokenizer(output_path):
             f.write(struct.pack("<i", i))
     print(f"[Exporter] Offline tokenizer created with {vocab_size} tokens.")
 
-def export_model(model_id, mode, output_path, tokenizer_out, dummy=False):
+def export_model(model_id, mode, output_path, tokenizer_out, dummy=False, version=2):
     is_w4a16 = (mode == "w4a16")
     quant_mode_val = 1 if is_w4a16 else 0
 
     if dummy:
         print("[Exporter] Generating deterministic model in memory (seed=42)...")
         torch.manual_seed(42)
+        vocab_size = 151936
+        hidden_size = 1536
+        intermediate_size = 8960
+        num_layers = 28
+        num_q_heads = 12
+        num_kv_heads = 2
+        head_dim = 128
+        max_seq_len = 4096
+        rms_norm_eps = 1e-6
+        rope_theta = 1000000.0
+        tie_word_embeddings = 1
+
         config = Qwen2Config(
-            vocab_size=VOCAB_SIZE,
-            hidden_size=HIDDEN_SIZE,
-            intermediate_size=INTERMEDIATE_SIZE,
-            num_hidden_layers=NUM_LAYERS,
-            num_attention_heads=NUM_Q_HEADS,
-            num_key_value_heads=NUM_KV_HEADS,
-            max_position_embeddings=4096,
-            rope_theta=1000000.0,
-            rms_norm_eps=1e-6,
+            vocab_size=vocab_size,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_hidden_layers=num_layers,
+            num_attention_heads=num_q_heads,
+            num_key_value_heads=num_kv_heads,
+            max_position_embeddings=max_seq_len,
+            rope_theta=rope_theta,
+            rms_norm_eps=rms_norm_eps,
             tie_word_embeddings=True
         )
         model = Qwen2ForCausalLM(config).half()
-        export_dummy_tokenizer(tokenizer_out)
+        export_dummy_tokenizer(tokenizer_out, vocab_size=vocab_size)
         state_dict = model.state_dict()
     else:
         print(f"[Exporter] Loading {model_id} from HuggingFace or local checkpoint...")
@@ -189,21 +192,41 @@ def export_model(model_id, mode, output_path, tokenizer_out, dummy=False):
                 trust_remote_code=True
             )
         state_dict = model.state_dict()
+        cfg = model.config
+        vocab_size = getattr(cfg, "vocab_size", 151936)
+        hidden_size = getattr(cfg, "hidden_size", 1536)
+        intermediate_size = getattr(cfg, "intermediate_size", 8960)
+        num_layers = getattr(cfg, "num_hidden_layers", 28)
+        num_q_heads = getattr(cfg, "num_attention_heads", 12)
+        num_kv_heads = getattr(cfg, "num_key_value_heads", 2)
+        head_dim = getattr(cfg, "head_dim", hidden_size // num_q_heads)
+        max_seq_len = getattr(cfg, "max_position_embeddings", 4096)
+        rms_norm_eps = float(getattr(cfg, "rms_norm_eps", 1e-6))
+        rope_theta = float(getattr(cfg, "rope_theta", 1000000.0))
+        tie_word_embeddings = 1 if getattr(cfg, "tie_word_embeddings", True) else 0
 
-    # Verify tied embeddings
     embed_w = state_dict["model.embed_tokens.weight"].numpy()
-    lm_head_w = state_dict["lm_head.weight"].numpy()
+    lm_head_w = state_dict["lm_head.weight"].numpy() if "lm_head.weight" in state_dict else embed_w
     if not np.array_equal(embed_w, lm_head_w):
-        print("[Exporter] Using embed_tokens for tied head.")
+        print("[Exporter] Notice: lm_head is distinct from embed_tokens.")
+        tie_word_embeddings = 0
 
-    print(f"[Exporter] Preparing .qwenbin in {mode.upper()} mode...")
+    print(f"[Exporter] Preparing .qwenbin v{version} in {mode.upper()} mode...")
     out_dir = os.path.dirname(output_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
     with open(output_path, "wb") as f:
-        # Reserve 4096 bytes for header
-        f.seek(4096)
+        # Determine payload offset
+        if version == 2:
+            # 4096-byte header + layer descriptors
+            layer_table_offset = 4096
+            layer_table_size = num_layers * 216
+            weights_offset = (layer_table_offset + layer_table_size + 255) & ~255
+            f.seek(weights_offset)
+        else:
+            weights_offset = 4096
+            f.seek(4096)
 
         def write_tensor(arr_bytes):
             offset = f.tell()
@@ -213,8 +236,8 @@ def export_model(model_id, mode, output_path, tokenizer_out, dummy=False):
                 f.write(b"\x00" * (256 - remainder))
             return offset
 
-        # 1. Tied embed_tokens / lm_head
-        print("  - Exporting tied embed_tokens / lm_head...")
+        # 1. Embed tokens
+        print("  - Exporting embed_tokens...")
         if is_w4a16:
             q_w, s_w = quantize_and_pack_w4a16(embed_w)
             embed_w_offset = write_tensor(q_w.tobytes())
@@ -223,125 +246,222 @@ def export_model(model_id, mode, output_path, tokenizer_out, dummy=False):
             embed_w_offset = write_tensor(embed_w.astype(np.float16).tobytes())
             embed_s_offset = 0
 
+        # LM Head (if untied)
+        if tie_word_embeddings == 0:
+            print("  - Exporting untied lm_head...")
+            if is_w4a16:
+                q_lm, s_lm = quantize_and_pack_w4a16(lm_head_w)
+                lm_head_offset = write_tensor(q_lm.tobytes())
+            else:
+                lm_head_offset = write_tensor(lm_head_w.astype(np.float16).tobytes())
+        else:
+            lm_head_offset = embed_w_offset
+
         # 2. Final norm
         final_norm_w = state_dict["model.norm.weight"].numpy().astype(np.float16)
         final_norm_offset = write_tensor(final_norm_w.tobytes())
 
-        # 3. 28 Layers
-        layer_offsets = [[0] * LayerTensorIdx.COUNT for _ in range(NUM_LAYERS)]
+        # 3. Layers
+        layer_offsets = [[0] * LayerTensorIdx.COUNT for _ in range(num_layers)]
+        layer_descriptors = []
 
-        for l in range(NUM_LAYERS):
+        for l in range(num_layers):
             prefix = f"model.layers.{l}."
             if l % 7 == 0:
-                print(f"  - Exporting Layer {l} .. {min(l + 6, NUM_LAYERS - 1)}...")
+                print(f"  - Exporting Layer {l} .. {min(l + 6, num_layers - 1)}...")
 
             in_norm = state_dict[prefix + "input_layernorm.weight"].numpy().astype(np.float16)
-            layer_offsets[l][LayerTensorIdx.INPUT_LAYERNORM] = write_tensor(in_norm.tobytes())
+            norm1_offset = write_tensor(in_norm.tobytes())
+            layer_offsets[l][LayerTensorIdx.INPUT_LAYERNORM] = norm1_offset
 
             q_w = state_dict[prefix + "self_attn.q_proj.weight"].numpy()
-            q_b = state_dict[prefix + "self_attn.q_proj.bias"].numpy().astype(np.float16)
+            q_b = state_dict[prefix + "self_attn.q_proj.bias"].numpy().astype(np.float16) if (prefix + "self_attn.q_proj.bias") in state_dict else np.zeros((q_w.shape[0],), dtype=np.float16)
             k_w = state_dict[prefix + "self_attn.k_proj.weight"].numpy()
-            k_b = state_dict[prefix + "self_attn.k_proj.bias"].numpy().astype(np.float16)
+            k_b = state_dict[prefix + "self_attn.k_proj.bias"].numpy().astype(np.float16) if (prefix + "self_attn.k_proj.bias") in state_dict else np.zeros((k_w.shape[0],), dtype=np.float16)
             v_w = state_dict[prefix + "self_attn.v_proj.weight"].numpy()
-            v_b = state_dict[prefix + "self_attn.v_proj.bias"].numpy().astype(np.float16)
+            v_b = state_dict[prefix + "self_attn.v_proj.bias"].numpy().astype(np.float16) if (prefix + "self_attn.v_proj.bias") in state_dict else np.zeros((v_w.shape[0],), dtype=np.float16)
 
+            q_scale_off = 0
+            k_scale_off = 0
+            v_scale_off = 0
             if is_w4a16:
                 packed_q, scale_q = quantize_and_pack_w4a16(q_w)
                 packed_k, scale_k = quantize_and_pack_w4a16(k_w)
                 packed_v, scale_v = quantize_and_pack_w4a16(v_w)
-                layer_offsets[l][LayerTensorIdx.Q_WEIGHT] = write_tensor(packed_q.tobytes())
-                layer_offsets[l][LayerTensorIdx.Q_SCALE]  = write_tensor(scale_q.tobytes())
-                layer_offsets[l][LayerTensorIdx.K_WEIGHT] = write_tensor(packed_k.tobytes())
-                layer_offsets[l][LayerTensorIdx.K_SCALE]  = write_tensor(scale_k.tobytes())
-                layer_offsets[l][LayerTensorIdx.V_WEIGHT] = write_tensor(packed_v.tobytes())
-                layer_offsets[l][LayerTensorIdx.V_SCALE]  = write_tensor(scale_v.tobytes())
-            else:
-                layer_offsets[l][LayerTensorIdx.Q_WEIGHT] = write_tensor(q_w.astype(np.float16).tobytes())
-                layer_offsets[l][LayerTensorIdx.K_WEIGHT] = write_tensor(k_w.astype(np.float16).tobytes())
-                layer_offsets[l][LayerTensorIdx.V_WEIGHT] = write_tensor(v_w.astype(np.float16).tobytes())
+                q_off = write_tensor(packed_q.tobytes())
+                q_scale_off = write_tensor(scale_q.tobytes())
+                k_off = write_tensor(packed_k.tobytes())
+                k_scale_off = write_tensor(scale_k.tobytes())
+                v_off = write_tensor(packed_v.tobytes())
+                v_scale_off = write_tensor(scale_v.tobytes())
 
-            layer_offsets[l][LayerTensorIdx.Q_BIAS] = write_tensor(q_b.tobytes())
-            layer_offsets[l][LayerTensorIdx.K_BIAS] = write_tensor(k_b.tobytes())
-            layer_offsets[l][LayerTensorIdx.V_BIAS] = write_tensor(v_b.tobytes())
+                layer_offsets[l][LayerTensorIdx.Q_WEIGHT] = q_off
+                layer_offsets[l][LayerTensorIdx.Q_SCALE]  = q_scale_off
+                layer_offsets[l][LayerTensorIdx.K_WEIGHT] = k_off
+                layer_offsets[l][LayerTensorIdx.K_SCALE]  = k_scale_off
+                layer_offsets[l][LayerTensorIdx.V_WEIGHT] = v_off
+                layer_offsets[l][LayerTensorIdx.V_SCALE]  = v_scale_off
+            else:
+                q_off = write_tensor(q_w.astype(np.float16).tobytes())
+                k_off = write_tensor(k_w.astype(np.float16).tobytes())
+                v_off = write_tensor(v_w.astype(np.float16).tobytes())
+                layer_offsets[l][LayerTensorIdx.Q_WEIGHT] = q_off
+                layer_offsets[l][LayerTensorIdx.K_WEIGHT] = k_off
+                layer_offsets[l][LayerTensorIdx.V_WEIGHT] = v_off
+
+            q_b_off = write_tensor(q_b.tobytes())
+            k_b_off = write_tensor(k_b.tobytes())
+            v_b_off = write_tensor(v_b.tobytes())
+            layer_offsets[l][LayerTensorIdx.Q_BIAS] = q_b_off
+            layer_offsets[l][LayerTensorIdx.K_BIAS] = k_b_off
+            layer_offsets[l][LayerTensorIdx.V_BIAS] = v_b_off
 
             o_w = state_dict[prefix + "self_attn.o_proj.weight"].numpy()
+            o_scale_off = 0
             if is_w4a16:
                 packed_o, scale_o = quantize_and_pack_w4a16(o_w)
-                layer_offsets[l][LayerTensorIdx.O_WEIGHT] = write_tensor(packed_o.tobytes())
-                layer_offsets[l][LayerTensorIdx.O_SCALE]  = write_tensor(scale_o.tobytes())
+                o_off = write_tensor(packed_o.tobytes())
+                o_scale_off = write_tensor(scale_o.tobytes())
+                layer_offsets[l][LayerTensorIdx.O_WEIGHT] = o_off
+                layer_offsets[l][LayerTensorIdx.O_SCALE]  = o_scale_off
             else:
-                layer_offsets[l][LayerTensorIdx.O_WEIGHT] = write_tensor(o_w.astype(np.float16).tobytes())
+                o_off = write_tensor(o_w.astype(np.float16).tobytes())
+                layer_offsets[l][LayerTensorIdx.O_WEIGHT] = o_off
 
             post_norm = state_dict[prefix + "post_attention_layernorm.weight"].numpy().astype(np.float16)
-            layer_offsets[l][LayerTensorIdx.POST_ATTENTION_LAYERNORM] = write_tensor(post_norm.tobytes())
+            norm2_off = write_tensor(post_norm.tobytes())
+            layer_offsets[l][LayerTensorIdx.POST_ATTENTION_LAYERNORM] = norm2_off
 
             gate_w = state_dict[prefix + "mlp.gate_proj.weight"].numpy()
             up_w   = state_dict[prefix + "mlp.up_proj.weight"].numpy()
-            gate_up_w = np.empty((2 * INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=np.float32)
+            gate_up_w = np.empty((2 * intermediate_size, hidden_size), dtype=np.float32)
             gate_up_w[0::2, :] = gate_w
             gate_up_w[1::2, :] = up_w
 
+            gate_up_scale_off = 0
             if is_w4a16:
                 packed_gu, scale_gu = quantize_and_pack_w4a16(gate_up_w)
-                layer_offsets[l][LayerTensorIdx.GATE_UP_WEIGHT] = write_tensor(packed_gu.tobytes())
-                layer_offsets[l][LayerTensorIdx.GATE_UP_SCALE]  = write_tensor(scale_gu.tobytes())
+                gu_off = write_tensor(packed_gu.tobytes())
+                gate_up_scale_off = write_tensor(scale_gu.tobytes())
+                layer_offsets[l][LayerTensorIdx.GATE_UP_WEIGHT] = gu_off
+                layer_offsets[l][LayerTensorIdx.GATE_UP_SCALE]  = gate_up_scale_off
             else:
-                layer_offsets[l][LayerTensorIdx.GATE_UP_WEIGHT] = write_tensor(gate_up_w.astype(np.float16).tobytes())
+                gu_off = write_tensor(gate_up_w.astype(np.float16).tobytes())
+                layer_offsets[l][LayerTensorIdx.GATE_UP_WEIGHT] = gu_off
 
             down_w = state_dict[prefix + "mlp.down_proj.weight"].numpy()
+            down_scale_off = 0
             if is_w4a16:
                 packed_dn, scale_dn = quantize_and_pack_w4a16(down_w)
-                layer_offsets[l][LayerTensorIdx.DOWN_WEIGHT] = write_tensor(packed_dn.tobytes())
-                layer_offsets[l][LayerTensorIdx.DOWN_SCALE]  = write_tensor(scale_dn.tobytes())
+                dn_off = write_tensor(packed_dn.tobytes())
+                down_scale_off = write_tensor(scale_dn.tobytes())
+                layer_offsets[l][LayerTensorIdx.DOWN_WEIGHT] = dn_off
+                layer_offsets[l][LayerTensorIdx.DOWN_SCALE]  = down_scale_off
             else:
-                layer_offsets[l][LayerTensorIdx.DOWN_WEIGHT] = write_tensor(down_w.astype(np.float16).tobytes())
+                dn_off = write_tensor(down_w.astype(np.float16).tobytes())
+                layer_offsets[l][LayerTensorIdx.DOWN_WEIGHT] = dn_off
 
-        # Write QWQwenHeader at byte 0
+            if version == 2:
+                # Build LayerDescriptor (216 bytes)
+                desc = struct.pack(
+                    "<2I26Q",
+                    LAYER_GQA, 0,
+                    norm1_off, norm2_off,
+                    q_off, q_b_off, k_b_off, v_b_off, o_off,
+                    0, 0, 0, 0, 0, # DeltaNet fields (conv1d_w, conv1d_b, in_proj, decay, out)
+                    gu_off, gu_off, dn_off, # mlp_gate, mlp_up, mlp_down
+                    q_scale_off, 0, # quant_scales_offset, quant_zeros_offset
+                    k_off, v_off, # k_weight, v_weight
+                    q_scale_off, k_scale_off, v_scale_off, o_scale_off,
+                    gate_up_scale_off, gate_up_scale_off, down_scale_off
+                )
+                layer_descriptors.append(desc)
+
         total_file_size = f.tell()
-        f.seek(0)
-        header_buf = bytearray(4096)
-        struct.pack_into(
-            "<12I3Q",
-            header_buf,
-            0,
-            MAGIC_QWEN,
-            FORMAT_VERSION,
-            quant_mode_val,
-            VOCAB_SIZE,
-            HIDDEN_SIZE,
-            INTERMEDIATE_SIZE,
-            NUM_LAYERS,
-            NUM_Q_HEADS,
-            NUM_KV_HEADS,
-            HEAD_DIM,
-            QUANT_GROUP_SIZE,
-            0,
-            embed_w_offset,
-            embed_s_offset,
-            final_norm_offset
-        )
 
-        offset_pos = struct.calcsize("<12I3Q")
-        for l in range(NUM_LAYERS):
-            for t in range(LayerTensorIdx.COUNT):
-                struct.pack_into("<Q", header_buf, offset_pos, layer_offsets[l][t])
-                offset_pos += 8
+        if version == 2:
+            # Write LayerDescriptor table
+            f.seek(layer_table_offset)
+            for desc in layer_descriptors:
+                f.write(desc)
 
-        f.write(header_buf)
+            # Write QwenBinHeaderV2 (4096 bytes)
+            f.seek(0)
+            header_buf = bytearray(4096)
+            struct.pack_into(
+                "<12I2f2I11Q",
+                header_buf,
+                0,
+                MAGIC_QWEN,
+                2, # version
+                hidden_size,
+                intermediate_size,
+                num_layers,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                vocab_size,
+                max_seq_len,
+                quant_mode_val,
+                tie_word_embeddings,
+                rms_norm_eps,
+                rope_theta,
+                0, # reserved_flags
+                0, # padding0 (alignment to 64 bytes)
+                layer_table_offset,
+                embed_w_offset,
+                final_norm_offset,
+                lm_head_offset,
+                weights_offset,
+                embed_s_offset, # reserved[0]
+                0, 0, 0, 0, 0   # reserved[1..5]
+            )
+            f.write(header_buf)
+        else:
+            # Write legacy QWQwenHeader at byte 0
+            f.seek(0)
+            header_buf = bytearray(4096)
+            struct.pack_into(
+                "<12I3Q",
+                header_buf,
+                0,
+                MAGIC_QWEN,
+                1,
+                quant_mode_val,
+                vocab_size,
+                hidden_size,
+                intermediate_size,
+                num_layers,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                QUANT_GROUP_SIZE,
+                0,
+                embed_w_offset,
+                embed_s_offset,
+                final_norm_offset
+            )
+            offset_pos = struct.calcsize("<12I3Q")
+            for l in range(num_layers):
+                for t in range(LayerTensorIdx.COUNT):
+                    struct.pack_into("<Q", header_buf, offset_pos, layer_offsets[l][t])
+                    offset_pos += 8
+            f.write(header_buf)
 
     file_mb = total_file_size / (1024.0 * 1024.0)
-    print(f"[Exporter] Successfully exported {output_path} ({file_mb:.2f} MB).")
+    print(f"[Exporter] Successfully exported {output_path} ({file_mb:.2f} MB, version {version}).")
 
 def main():
-    parser = argparse.ArgumentParser(description="Export Qwen2.5-1.5B to .qwenbin")
+    parser = argparse.ArgumentParser(description="Export Qwen2.5 to .qwenbin")
     parser.add_argument("--model-id", default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--mode", choices=["fp16", "w4a16"], default="w4a16")
     parser.add_argument("--out", default="models/qwen25_1.5b_w4a16.qwenbin")
     parser.add_argument("--tokenizer-out", default="models/tokenizer.bin")
     parser.add_argument("--dummy", action="store_true", help="Generate initialized model offline without downloading weights")
+    parser.add_argument("--format-version", type=int, choices=[1, 2], default=2, help="Container format version (1 or 2)")
     args = parser.parse_args()
 
-    export_model(args.model_id, args.mode, args.out, args.tokenizer_out, dummy=args.dummy)
+    export_model(args.model_id, args.mode, args.out, args.tokenizer_out, dummy=args.dummy, version=args.format_version)
 
 if __name__ == "__main__":
     main()
