@@ -148,13 +148,15 @@ __global__ void gemv_qkv_fp16_kernel(
 // ----------------------------------------------------------------------------
 
 __global__ void gemv_dual_gate_up_swiglu_fp16_kernel(
-    const half* __restrict__ gate_up_weight, // [8960, 2, 1536] interleaved by row
-    const half* __restrict__ input_x,        // [1536]
-    half* __restrict__ output_mlp            // [8960]
+    const half* __restrict__ gate_up_weight,
+    const half* __restrict__ input_x,
+    half* __restrict__ output_mlp,
+    int in_features,
+    int intermediate_size
 ) {
     extern __shared__ half s_x[];
 
-    for (int i = threadIdx.x; i < HIDDEN_SIZE; i += blockDim.x) {
+    for (int i = threadIdx.x; i < in_features; i += blockDim.x) {
         s_x[i] = input_x[i];
     }
     __syncthreads();
@@ -164,21 +166,21 @@ __global__ void gemv_dual_gate_up_swiglu_fp16_kernel(
     int warps_per_block = blockDim.x / 32;
     int r = blockIdx.x * warps_per_block + warp_id_in_block;
 
-    if (r >= INTERMEDIATE_SIZE) return;
+    if (r >= intermediate_size) return;
 
-    const half* gate_row = gate_up_weight + (static_cast<size_t>(2 * r) + 0) * HIDDEN_SIZE;
-    const half* up_row   = gate_up_weight + (static_cast<size_t>(2 * r) + 1) * HIDDEN_SIZE;
+    const half* gate_row = gate_up_weight + (static_cast<size_t>(2 * r) + 0) * in_features;
+    const half* up_row   = gate_up_weight + (static_cast<size_t>(2 * r) + 1) * in_features;
 
     const uint4* gate_u4 = reinterpret_cast<const uint4*>(gate_row);
     const uint4* up_u4   = reinterpret_cast<const uint4*>(up_row);
     const uint4* x_u4    = reinterpret_cast<const uint4*>(s_x);
 
-    constexpr int NUM_U4 = HIDDEN_SIZE / 8; // 192
+    int num_u4 = in_features / 8;
 
     float gate_acc = 0.0f;
     float up_acc   = 0.0f;
 
-    for (int i = lane_id; i < NUM_U4; i += 32) {
+    for (int i = lane_id; i < num_u4; i += 32) {
         uint4 g_val = gate_u4[i];
         uint4 u_val = up_u4[i];
         uint4 x_val = x_u4[i];
@@ -251,15 +253,17 @@ void launch_gemv_dual_gate_up_swiglu_fp16(
     const half* gate_up_weight,
     const half* input_x,
     half* output_mlp,
+    int hidden_size,
+    int intermediate_size,
     cudaStream_t stream
 ) {
     constexpr int BLOCK_THREADS = 128;
     constexpr int WARPS_PER_BLOCK = BLOCK_THREADS / 32;
-    int grid_size = (INTERMEDIATE_SIZE + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-    size_t smem_bytes = static_cast<size_t>(HIDDEN_SIZE) * sizeof(half);
+    int grid_size = (intermediate_size + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    size_t smem_bytes = static_cast<size_t>(hidden_size) * sizeof(half);
 
     gemv_dual_gate_up_swiglu_fp16_kernel<<<grid_size, BLOCK_THREADS, smem_bytes, stream>>>(
-        gate_up_weight, input_x, output_mlp
+        gate_up_weight, input_x, output_mlp, hidden_size, intermediate_size
     );
     CUDA_KERNEL_CHECK();
 }

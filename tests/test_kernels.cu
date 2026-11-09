@@ -222,7 +222,7 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaMemcpy(d_test_in, ref_post_norm, HIDDEN_SIZE * sizeof(half), cudaMemcpyHostToDevice));
             launch_gemv_dual_gate_up_swiglu_fp16(
                 reinterpret_cast<const half*>(engine_fp16->layer_weights(0).gate_up_weight),
-                d_test_in, d_test_out, stream
+                d_test_in, d_test_out, HIDDEN_SIZE, INTERMEDIATE_SIZE, stream
             );
             CUDA_CHECK(cudaMemcpy(h_test_out.data(), d_test_out, INTERMEDIATE_SIZE * sizeof(half), cudaMemcpyDeviceToHost));
             float err_swiglu = compute_max_abs_err(h_test_out.data(), ref_swiglu, INTERMEDIATE_SIZE);
@@ -471,7 +471,7 @@ int main(int argc, char** argv) {
             launch_gemv_dual_gate_up_swiglu_w4a16(
                 reinterpret_cast<const uint32_t*>(engine_w4a16->layer_weights(0).gate_up_weight),
                 engine_w4a16->layer_weights(0).gate_up_scale,
-                d_test_in, d_test_out, stream
+                d_test_in, d_test_out, HIDDEN_SIZE, INTERMEDIATE_SIZE, stream
             );
             CUDA_CHECK(cudaMemcpy(h_test_out.data(), d_test_out, INTERMEDIATE_SIZE * sizeof(half), cudaMemcpyDeviceToHost));
             float cos_w4_swiglu = compute_cosine_similarity(h_test_out.data(), ref_swiglu, INTERMEDIATE_SIZE);

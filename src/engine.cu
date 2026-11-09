@@ -297,9 +297,16 @@ void QwenEngine::setup_arena() {
     ws_.d_sample_idx    = reinterpret_cast<int32_t*>(arena_->allocate(256 * sizeof(int32_t), 256));
     ws_.d_prompt_tokens = reinterpret_cast<int32_t*>(arena_->allocate(max_seq_len_ * sizeof(int32_t), 256));
 
-    ws_.d_act_q8    = reinterpret_cast<int8_t*>(reinterpret_cast<uint8_t*>(ws_.d_act_1) + 65536);
-    ws_.d_act_scale = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(ws_.d_act_1) + 74752);
-    ws_.d_act_sum8  = reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(ws_.d_act_1) + 75264);
+    size_t q8_offset = 65536;
+    size_t q8_bytes = ((static_cast<size_t>(i_dim) + 255) / 256) * 256;
+    size_t scale_offset = q8_offset + q8_bytes;
+    size_t num_groups = (static_cast<size_t>(i_dim) + QUANT_GROUP_SIZE - 1) / QUANT_GROUP_SIZE;
+    size_t scale_bytes = ((num_groups * sizeof(float) + 255) / 256) * 256;
+    size_t sum8_offset = scale_offset + scale_bytes;
+
+    ws_.d_act_q8    = reinterpret_cast<int8_t*>(reinterpret_cast<uint8_t*>(ws_.d_act_1) + q8_offset);
+    ws_.d_act_scale = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(ws_.d_act_1) + scale_offset);
+    ws_.d_act_sum8  = reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(ws_.d_act_1) + sum8_offset);
 
     d_control_ = reinterpret_cast<DeviceControlBlock*>(arena_->allocate(sizeof(DeviceControlBlock), 256));
 
@@ -477,7 +484,7 @@ void QwenEngine::execute_decode_pass() {
 
         if (quant_mode_ == QuantMode::FP16) {
             launch_rmsnorm_fp16(ws_.d_act_0, layers_[l].post_attention_layernorm, ws_.d_act_1, 1, stream_);
-            launch_gemv_dual_gate_up_swiglu_fp16(reinterpret_cast<const half*>(layers_[l].gate_up_weight), ws_.d_act_1, ws_.d_mlp_act, stream_);
+            launch_gemv_dual_gate_up_swiglu_fp16(reinterpret_cast<const half*>(layers_[l].gate_up_weight), ws_.d_act_1, ws_.d_mlp_act, h_dim, i_dim, stream_);
             launch_gemv_fp16(reinterpret_cast<const half*>(layers_[l].down_weight), ws_.d_mlp_act, mlp_residual_ptr, mlp_output_ptr, h_dim, i_dim, stream_);
         } else {
             launch_rmsnorm_q8_1(
@@ -488,7 +495,7 @@ void QwenEngine::execute_decode_pass() {
                 reinterpret_cast<const uint32_t*>(layers_[l].gate_up_weight),
                 layers_[l].gate_up_scale,
                 ws_.d_act_q8, ws_.d_act_scale, ws_.d_act_sum8,
-                ws_.d_mlp_act, stream_
+                ws_.d_mlp_act, h_dim, i_dim, stream_
             );
             launch_quantize_fp16_to_q8_1(ws_.d_mlp_act, ws_.d_act_q8, ws_.d_act_scale, ws_.d_act_sum8, i_dim, stream_);
             launch_gemv_w4a8(

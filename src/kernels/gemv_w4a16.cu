@@ -266,28 +266,29 @@ __global__ void gemv_dual_gate_up_swiglu_w4a8_kernel(
     const int8_t* __restrict__ input_q8,
     const float* __restrict__ input_scale,
     const int32_t* __restrict__ input_sum8,
-    half* __restrict__ output_mlp
+    half* __restrict__ output_mlp,
+    int in_features,
+    int intermediate_size
 ) {
-    constexpr int IN_FEATURES = HIDDEN_SIZE; // 1536
-    constexpr int NUM_GROUPS = IN_FEATURES / QUANT_GROUP_SIZE; // 12
-    constexpr int NUM_WARP_STEPS = IN_FEATURES / 256; // 6
+    int num_groups = in_features / QUANT_GROUP_SIZE;
+    int num_warp_steps = in_features / 256;
 
     extern __shared__ uint8_t s_mem[];
     int8_t* s_x_q8 = reinterpret_cast<int8_t*>(s_mem);
-    int32_t* s_x_sum8 = reinterpret_cast<int32_t*>(s_mem + IN_FEATURES);
-    float* s_x_scale = reinterpret_cast<float*>(s_mem + IN_FEATURES + (IN_FEATURES / 8) * sizeof(int32_t));
+    int32_t* s_x_sum8 = reinterpret_cast<int32_t*>(s_mem + in_features);
+    float* s_x_scale = reinterpret_cast<float*>(s_mem + in_features + (in_features / 8) * sizeof(int32_t));
 
-    int num_u4 = IN_FEATURES / 16;
+    int num_u4 = in_features / 16;
     const uint4* in_q8_u4 = reinterpret_cast<const uint4*>(input_q8);
     uint4* s_q8_u4 = reinterpret_cast<uint4*>(s_x_q8);
     for (int i = threadIdx.x; i < num_u4; i += blockDim.x) {
         s_q8_u4[i] = in_q8_u4[i];
     }
-    int num_sum8 = IN_FEATURES / 8;
+    int num_sum8 = in_features / 8;
     for (int i = threadIdx.x; i < num_sum8; i += blockDim.x) {
         s_x_sum8[i] = input_sum8[i];
     }
-    for (int i = threadIdx.x; i < NUM_GROUPS; i += blockDim.x) {
+    for (int i = threadIdx.x; i < num_groups; i += blockDim.x) {
         s_x_scale[i] = input_scale[i];
     }
     __syncthreads();
@@ -307,7 +308,7 @@ __global__ void gemv_dual_gate_up_swiglu_w4a8_kernel(
 
     float acc_gate0 = 0.0f, acc_up0 = 0.0f, acc_gate1 = 0.0f, acc_up1 = 0.0f;
 
-    for (int s = 0; s < NUM_WARP_STEPS; ++s) {
+    for (int s = 0; s < num_warp_steps; ++s) {
         int group_idx = 2 * s + (lane_id >> 4);
         int sub_lane = lane_id & 15;
         int sum8_idx = group_idx * 16 + sub_lane;
@@ -319,32 +320,32 @@ __global__ void gemv_dual_gate_up_swiglu_w4a8_kernel(
         int32_t x_hi = x_pair.y;
         float x_d = s_x_scale[group_idx];
 
-        if (out_feat0 < INTERMEDIATE_SIZE) {
-            const uint32_t* row_qw_g0 = gate_up_qweight + static_cast<size_t>(row_gate0) * (IN_FEATURES / 8);
-            const half* row_sc_g0 = gate_up_scales + static_cast<size_t>(row_gate0) * NUM_GROUPS;
+        if (out_feat0 < intermediate_size) {
+            const uint32_t* row_qw_g0 = gate_up_qweight + static_cast<size_t>(row_gate0) * (in_features / 8);
+            const half* row_sc_g0 = gate_up_scales + static_cast<size_t>(row_gate0) * num_groups;
             uint32_t pg0 = row_qw_g0[s * 32 + lane_id];
             int32_t dot_g0 = dp4a_w4_q8_oct(pg0, x_lo, x_hi, x_sum8);
             float wd_g0 = __half2float(row_sc_g0[group_idx]);
             acc_gate0 += static_cast<float>(dot_g0) * (wd_g0 * x_d);
 
-            const uint32_t* row_qw_u0 = gate_up_qweight + static_cast<size_t>(row_up0) * (IN_FEATURES / 8);
-            const half* row_sc_u0 = gate_up_scales + static_cast<size_t>(row_up0) * NUM_GROUPS;
+            const uint32_t* row_qw_u0 = gate_up_qweight + static_cast<size_t>(row_up0) * (in_features / 8);
+            const half* row_sc_u0 = gate_up_scales + static_cast<size_t>(row_up0) * num_groups;
             uint32_t pu0 = row_qw_u0[s * 32 + lane_id];
             int32_t dot_u0 = dp4a_w4_q8_oct(pu0, x_lo, x_hi, x_sum8);
             float wd_u0 = __half2float(row_sc_u0[group_idx]);
             acc_up0 += static_cast<float>(dot_u0) * (wd_u0 * x_d);
         }
 
-        if (out_feat1 < INTERMEDIATE_SIZE) {
-            const uint32_t* row_qw_g1 = gate_up_qweight + static_cast<size_t>(row_gate1) * (IN_FEATURES / 8);
-            const half* row_sc_g1 = gate_up_scales + static_cast<size_t>(row_gate1) * NUM_GROUPS;
+        if (out_feat1 < intermediate_size) {
+            const uint32_t* row_qw_g1 = gate_up_qweight + static_cast<size_t>(row_gate1) * (in_features / 8);
+            const half* row_sc_g1 = gate_up_scales + static_cast<size_t>(row_gate1) * num_groups;
             uint32_t pg1 = row_qw_g1[s * 32 + lane_id];
             int32_t dot_g1 = dp4a_w4_q8_oct(pg1, x_lo, x_hi, x_sum8);
             float wd_g1 = __half2float(row_sc_g1[group_idx]);
             acc_gate1 += static_cast<float>(dot_g1) * (wd_g1 * x_d);
 
-            const uint32_t* row_qw_u1 = gate_up_qweight + static_cast<size_t>(row_up1) * (IN_FEATURES / 8);
-            const half* row_sc_u1 = gate_up_scales + static_cast<size_t>(row_up1) * NUM_GROUPS;
+            const uint32_t* row_qw_u1 = gate_up_qweight + static_cast<size_t>(row_up1) * (in_features / 8);
+            const half* row_sc_u1 = gate_up_scales + static_cast<size_t>(row_up1) * num_groups;
             uint32_t pu1 = row_qw_u1[s * 32 + lane_id];
             int32_t dot_u1 = dp4a_w4_q8_oct(pu1, x_lo, x_hi, x_sum8);
             float wd_u1 = __half2float(row_sc_u1[group_idx]);
@@ -361,11 +362,11 @@ __global__ void gemv_dual_gate_up_swiglu_w4a8_kernel(
     }
 
     if (lane_id == 0) {
-        if (out_feat0 < INTERMEDIATE_SIZE) {
+        if (out_feat0 < intermediate_size) {
             float silu0 = acc_gate0 / (1.0f + expf(-acc_gate0));
             output_mlp[out_feat0] = __float2half(silu0 * acc_up0);
         }
-        if (out_feat1 < INTERMEDIATE_SIZE) {
+        if (out_feat1 < intermediate_size) {
             float silu1 = acc_gate1 / (1.0f + expf(-acc_gate1));
             output_mlp[out_feat1] = __float2half(silu1 * acc_up1);
         }
@@ -496,21 +497,22 @@ __global__ void gemv_dual_gate_up_swiglu_w4a16_standalone_kernel(
     const uint32_t* __restrict__ gate_up_qweight,
     const half* __restrict__ gate_up_scales,
     const half* __restrict__ input_x,
-    half* __restrict__ output_mlp
+    half* __restrict__ output_mlp,
+    int in_features,
+    int intermediate_size
 ) {
-    constexpr int IN_FEATURES = HIDDEN_SIZE; // 1536
-    constexpr int NUM_GROUPS = IN_FEATURES / QUANT_GROUP_SIZE; // 12
-    constexpr int NUM_WARP_STEPS = IN_FEATURES / 256; // 6
+    int num_groups = in_features / QUANT_GROUP_SIZE;
+    int num_warp_steps = in_features / 256;
 
     extern __shared__ uint8_t s_mem[];
     int8_t* s_x_q8 = reinterpret_cast<int8_t*>(s_mem);
-    int32_t* s_x_sum8 = reinterpret_cast<int32_t*>(s_mem + IN_FEATURES);
-    float* s_x_scale = reinterpret_cast<float*>(s_mem + IN_FEATURES + (IN_FEATURES / 8) * sizeof(int32_t));
+    int32_t* s_x_sum8 = reinterpret_cast<int32_t*>(s_mem + in_features);
+    float* s_x_scale = reinterpret_cast<float*>(s_mem + in_features + (in_features / 8) * sizeof(int32_t));
 
     int half_warp_id = threadIdx.x >> 4;
     int sub_lane = threadIdx.x & 15;
 
-    for (int g = half_warp_id; g < NUM_GROUPS; g += 8) {
+    for (int g = half_warp_id; g < num_groups; g += 8) {
         const half* g_src = input_x + g * QUANT_GROUP_SIZE + sub_lane * 8;
         float vals[8];
         #pragma unroll
@@ -534,7 +536,7 @@ __global__ void gemv_dual_gate_up_swiglu_w4a16_standalone_kernel(
 
     float acc_gate0 = 0.0f, acc_up0 = 0.0f, acc_gate1 = 0.0f, acc_up1 = 0.0f;
 
-    for (int s = 0; s < NUM_WARP_STEPS; ++s) {
+    for (int s = 0; s < num_warp_steps; ++s) {
         int group_idx = 2 * s + (lane_id >> 4);
         int sub_lane_idx = lane_id & 15;
         int sum8_idx = group_idx * 16 + sub_lane_idx;
@@ -546,32 +548,32 @@ __global__ void gemv_dual_gate_up_swiglu_w4a16_standalone_kernel(
         int32_t x_hi = x_pair.y;
         float x_d = s_x_scale[group_idx];
 
-        if (out_feat0 < INTERMEDIATE_SIZE) {
-            const uint32_t* row_qw_g0 = gate_up_qweight + static_cast<size_t>(row_gate0) * (IN_FEATURES / 8);
-            const half* row_sc_g0 = gate_up_scales + static_cast<size_t>(row_gate0) * NUM_GROUPS;
+        if (out_feat0 < intermediate_size) {
+            const uint32_t* row_qw_g0 = gate_up_qweight + static_cast<size_t>(row_gate0) * (in_features / 8);
+            const half* row_sc_g0 = gate_up_scales + static_cast<size_t>(row_gate0) * num_groups;
             uint32_t pg0 = row_qw_g0[s * 32 + lane_id];
             int32_t dot_g0 = dp4a_w4_q8_oct(pg0, x_lo, x_hi, x_sum8);
             float wd_g0 = __half2float(row_sc_g0[group_idx]);
             acc_gate0 += static_cast<float>(dot_g0) * (wd_g0 * x_d);
 
-            const uint32_t* row_qw_u0 = gate_up_qweight + static_cast<size_t>(row_up0) * (IN_FEATURES / 8);
-            const half* row_sc_u0 = gate_up_scales + static_cast<size_t>(row_up0) * NUM_GROUPS;
+            const uint32_t* row_qw_u0 = gate_up_qweight + static_cast<size_t>(row_up0) * (in_features / 8);
+            const half* row_sc_u0 = gate_up_scales + static_cast<size_t>(row_up0) * num_groups;
             uint32_t pu0 = row_qw_u0[s * 32 + lane_id];
             int32_t dot_u0 = dp4a_w4_q8_oct(pu0, x_lo, x_hi, x_sum8);
             float wd_u0 = __half2float(row_sc_u0[group_idx]);
             acc_up0 += static_cast<float>(dot_u0) * (wd_u0 * x_d);
         }
 
-        if (out_feat1 < INTERMEDIATE_SIZE) {
-            const uint32_t* row_qw_g1 = gate_up_qweight + static_cast<size_t>(row_gate1) * (IN_FEATURES / 8);
-            const half* row_sc_g1 = gate_up_scales + static_cast<size_t>(row_gate1) * NUM_GROUPS;
+        if (out_feat1 < intermediate_size) {
+            const uint32_t* row_qw_g1 = gate_up_qweight + static_cast<size_t>(row_gate1) * (in_features / 8);
+            const half* row_sc_g1 = gate_up_scales + static_cast<size_t>(row_gate1) * num_groups;
             uint32_t pg1 = row_qw_g1[s * 32 + lane_id];
             int32_t dot_g1 = dp4a_w4_q8_oct(pg1, x_lo, x_hi, x_sum8);
             float wd_g1 = __half2float(row_sc_g1[group_idx]);
             acc_gate1 += static_cast<float>(dot_g1) * (wd_g1 * x_d);
 
-            const uint32_t* row_qw_u1 = gate_up_qweight + static_cast<size_t>(row_up1) * (IN_FEATURES / 8);
-            const half* row_sc_u1 = gate_up_scales + static_cast<size_t>(row_up1) * NUM_GROUPS;
+            const uint32_t* row_qw_u1 = gate_up_qweight + static_cast<size_t>(row_up1) * (in_features / 8);
+            const half* row_sc_u1 = gate_up_scales + static_cast<size_t>(row_up1) * num_groups;
             uint32_t pu1 = row_qw_u1[s * 32 + lane_id];
             int32_t dot_u1 = dp4a_w4_q8_oct(pu1, x_lo, x_hi, x_sum8);
             float wd_u1 = __half2float(row_sc_u1[group_idx]);
@@ -588,11 +590,11 @@ __global__ void gemv_dual_gate_up_swiglu_w4a16_standalone_kernel(
     }
 
     if (lane_id == 0) {
-        if (out_feat0 < INTERMEDIATE_SIZE) {
+        if (out_feat0 < intermediate_size) {
             float silu0 = acc_gate0 / (1.0f + expf(-acc_gate0));
             output_mlp[out_feat0] = __float2half(silu0 * acc_up0);
         }
-        if (out_feat1 < INTERMEDIATE_SIZE) {
+        if (out_feat1 < intermediate_size) {
             float silu1 = acc_gate1 / (1.0f + expf(-acc_gate1));
             output_mlp[out_feat1] = __float2half(silu1 * acc_up1);
         }
@@ -652,15 +654,18 @@ void launch_gemv_dual_gate_up_swiglu_w4a8(
     const float* input_scale,
     const int32_t* input_sum8,
     half* output_mlp,
+    int hidden_size,
+    int intermediate_size,
     cudaStream_t stream
 ) {
     constexpr int BLOCK_THREADS = 128;
     constexpr int OUT_PER_BLOCK = 8; // 4 warps * 2 intermediate outputs = 8
-    int grid = (INTERMEDIATE_SIZE + OUT_PER_BLOCK - 1) / OUT_PER_BLOCK; // 8960 / 8 = 1120
-    size_t smem = static_cast<size_t>(HIDDEN_SIZE) * 49 / 32;
+    int grid = (intermediate_size + OUT_PER_BLOCK - 1) / OUT_PER_BLOCK;
+    size_t smem = static_cast<size_t>(hidden_size) * 49 / 32;
 
     gemv_dual_gate_up_swiglu_w4a8_kernel<<<grid, BLOCK_THREADS, smem, stream>>>(
-        gate_up_qweight, gate_up_scales, input_q8, input_scale, input_sum8, output_mlp
+        gate_up_qweight, gate_up_scales, input_q8, input_scale, input_sum8, output_mlp,
+        hidden_size, intermediate_size
     );
     CUDA_KERNEL_CHECK();
 }
@@ -691,15 +696,17 @@ void launch_gemv_dual_gate_up_swiglu_w4a16(
     const half* gate_up_scales,
     const half* input_x,
     half* output_mlp,
+    int hidden_size,
+    int intermediate_size,
     cudaStream_t stream
 ) {
     constexpr int BLOCK_THREADS = 128;
     constexpr int OUT_PER_BLOCK = 8;
-    int grid = (INTERMEDIATE_SIZE + OUT_PER_BLOCK - 1) / OUT_PER_BLOCK;
-    size_t smem = static_cast<size_t>(HIDDEN_SIZE) * 49 / 32;
+    int grid = (intermediate_size + OUT_PER_BLOCK - 1) / OUT_PER_BLOCK;
+    size_t smem = static_cast<size_t>(hidden_size) * 49 / 32;
 
     gemv_dual_gate_up_swiglu_w4a16_standalone_kernel<<<grid, BLOCK_THREADS, smem, stream>>>(
-        gate_up_qweight, gate_up_scales, input_x, output_mlp
+        gate_up_qweight, gate_up_scales, input_x, output_mlp, hidden_size, intermediate_size
     );
     CUDA_KERNEL_CHECK();
 }

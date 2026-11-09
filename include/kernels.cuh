@@ -83,6 +83,8 @@ void launch_gemv_dual_gate_up_swiglu_fp16(
     const half* gate_up_weight,
     const half* input_x,
     half* output_mlp,
+    int hidden_size,
+    int intermediate_size,
     cudaStream_t stream
 );
 
@@ -124,6 +126,8 @@ void launch_gemv_dual_gate_up_swiglu_w4a16(
     const half* gate_up_scales,
     const half* input_x,
     half* output_mlp,
+    int hidden_size,
+    int intermediate_size,
     cudaStream_t stream
 );
 
@@ -134,6 +138,8 @@ void launch_gemv_dual_gate_up_swiglu_w4a8(
     const float* input_scale,
     const int32_t* input_sum8,
     half* output_mlp,
+    int hidden_size,
+    int intermediate_size,
     cudaStream_t stream
 );
 

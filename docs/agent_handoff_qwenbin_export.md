@@ -1,5 +1,7 @@
 # Engineering Handoff: Qwen Unified Model Exporter & Inference Engine (.qwenbin v2)
 
+> **Notice for Inference / Runtime Agents**: For active CUDA runtime debugging, DeltaNet kernel analysis, and release wheel instructions, refer to [`docs/agent_handoff_inference_and_deltanet.md`](file:///c:/Users/agraw/OneDrive/Desktop/cuda-projects/docs/agent_handoff_inference_and_deltanet.md).
+
 ## 1. Hardware & Environment Grounding
 
 * **Accelerator Target**: **2x NVIDIA Tesla T4 GPUs** (Dual-GPU configuration).

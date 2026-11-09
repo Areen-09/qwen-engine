@@ -43,8 +43,11 @@ __global__ void deltanet_decode_sm75_kernel(
     half* out_h = out + head_offset;
 
     // Decay factor alpha = exp(-softplus(beta)) = 1 / (1 + exp(beta))
-    float beta_val = __half2float(beta[b * num_heads + h]);
-    float alpha = 1.0f / (1.0f + expf(beta_val));
+    float alpha = 1.0f;
+    if (beta != nullptr) {
+        float beta_val = __half2float(beta[b * num_heads + h]);
+        alpha = 1.0f / (1.0f + expf(beta_val));
+    }
 
     // Double-buffered shared memory sub-tile: 16 KB total
     __shared__ float smem_subtile[2][32][64];
@@ -137,6 +140,11 @@ __global__ void depthwise_conv1d_step_kernel(
 ) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= num_channels) return;
+
+    if (weight == nullptr) {
+        out[c] = in[c];
+        return;
+    }
 
     int history_len = kernel_size - 1; // typically 3
     half* state_c = conv_state + static_cast<size_t>(c) * history_len;
