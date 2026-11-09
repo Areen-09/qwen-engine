@@ -1,8 +1,28 @@
+#ifdef _WIN32
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+#else
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+using SOCKET = int;
+constexpr int INVALID_SOCKET = -1;
+constexpr int SOCKET_ERROR = -1;
+#define closesocket close
+#endif
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 
 #include "config.cuh"
 #include "engine.cuh"
@@ -15,8 +35,6 @@
 #include <vector>
 #include <chrono>
 #include <algorithm>
-
-#pragma comment(lib, "ws2_32.lib")
 
 using namespace qwen;
 
@@ -115,35 +133,50 @@ int main(int argc, char** argv) {
     std::cout << "[Server] Loading QwenTokenizer from " << tokenizer_path << "..." << std::endl;
     QwenTokenizer tokenizer(tokenizer_path);
 
+#ifdef _WIN32
     WSADATA wsa_data;
     if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
         std::cerr << "[Server] Failed to initialize Winsock" << std::endl;
         return 1;
     }
+#endif
 
     SOCKET listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listen_sock == INVALID_SOCKET) {
         std::cerr << "[Server] Failed to create socket" << std::endl;
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
+
+    int opt = 1;
+#ifdef _WIN32
+    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
+#else
+    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#endif
 
     sockaddr_in server_addr{};
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    server_addr.sin_port = htons(static_cast<u_short>(port));
+    server_addr.sin_port = htons(static_cast<uint16_t>(port));
 
     if (bind(listen_sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) == SOCKET_ERROR) {
         std::cerr << "[Server] Bind failed on 127.0.0.1:" << port << std::endl;
         closesocket(listen_sock);
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
 
     if (listen(listen_sock, SOMAXCONN) == SOCKET_ERROR) {
         std::cerr << "[Server] Listen failed" << std::endl;
         closesocket(listen_sock);
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
 
@@ -187,7 +220,7 @@ int main(int argc, char** argv) {
                                    "Content-Type: text/html; charset=UTF-8\r\n"
                                    "Content-Length: " + std::to_string(body.size()) + "\r\n"
                                    "Connection: close\r\n\r\n" + body;
-            send(client_sock, response.c_str(), static_cast<int>(response.size()), 0);
+            send(client_sock, response.c_str(), static_cast<int>(response.size()), MSG_NOSIGNAL);
             closesocket(client_sock);
 
         } else if (method == "GET" && path == "/api/stats") {
@@ -205,7 +238,7 @@ int main(int argc, char** argv) {
                                    "Access-Control-Allow-Origin: *\r\n"
                                    "Content-Length: " + std::to_string(body.size()) + "\r\n"
                                    "Connection: close\r\n\r\n" + body;
-            send(client_sock, response.c_str(), static_cast<int>(response.size()), 0);
+            send(client_sock, response.c_str(), static_cast<int>(response.size()), MSG_NOSIGNAL);
             closesocket(client_sock);
 
         } else if (method == "POST" && path == "/api/reset") {
@@ -216,7 +249,7 @@ int main(int argc, char** argv) {
                                    "Access-Control-Allow-Origin: *\r\n"
                                    "Content-Length: " + std::to_string(body.size()) + "\r\n"
                                    "Connection: close\r\n\r\n" + body;
-            send(client_sock, response.c_str(), static_cast<int>(response.size()), 0);
+            send(client_sock, response.c_str(), static_cast<int>(response.size()), MSG_NOSIGNAL);
             closesocket(client_sock);
 
         } else if (method == "POST" && path == "/api/chat") {
@@ -253,7 +286,7 @@ int main(int argc, char** argv) {
                                   "Cache-Control: no-cache\r\n"
                                   "Connection: close\r\n"
                                   "Access-Control-Allow-Origin: *\r\n\r\n";
-            send(client_sock, sse_hdr.c_str(), static_cast<int>(sse_hdr.size()), 0);
+            send(client_sock, sse_hdr.c_str(), static_cast<int>(sse_hdr.size()), MSG_NOSIGNAL);
 
             // Prefill
             auto t_prefill_start = std::chrono::steady_clock::now();
@@ -274,7 +307,7 @@ int main(int argc, char** argv) {
                         << "\"cached_tokens\":" << engine.cached_tokens().size()
                         << "}\n\n";
             std::string first_str = first_frame.str();
-            send(client_sock, first_str.c_str(), static_cast<int>(first_str.size()), 0);
+            send(client_sock, first_str.c_str(), static_cast<int>(first_str.size()), MSG_NOSIGNAL);
 
             // Autoregressive decode loop overlapping socket send with CUDA Graph execution
             int32_t prev_token = first_token;
@@ -302,7 +335,7 @@ int main(int argc, char** argv) {
                           << "\"cached_tokens\":" << engine.cached_tokens().size()
                           << "}\n\n";
                 std::string frame_str = sse_frame.str();
-                if (send(client_sock, frame_str.c_str(), static_cast<int>(frame_str.size()), 0) <= 0) {
+                if (send(client_sock, frame_str.c_str(), static_cast<int>(frame_str.size()), MSG_NOSIGNAL) <= 0) {
                     break; // Client disconnected
                 }
 
@@ -313,12 +346,14 @@ int main(int argc, char** argv) {
             closesocket(client_sock);
         } else {
             std::string response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            send(client_sock, response.c_str(), static_cast<int>(response.size()), 0);
+            send(client_sock, response.c_str(), static_cast<int>(response.size()), MSG_NOSIGNAL);
             closesocket(client_sock);
         }
     }
 
     closesocket(listen_sock);
+#ifdef _WIN32
     WSACleanup();
+#endif
     return 0;
 }

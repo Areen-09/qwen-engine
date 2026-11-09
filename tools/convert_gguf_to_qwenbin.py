@@ -200,19 +200,19 @@ class GGUFReader:
         for d in dims:
             num_elements *= d
 
+        expected_bytes = num_elements * (4 if type_id == GGML_TYPE_F32 else 2)
+        raw = self.file.read(expected_bytes)
+        if len(raw) < expected_bytes:
+            raw = raw + b"\x00" * (expected_bytes - len(raw))
+
         if type_id == GGML_TYPE_F32:
-            raw = self.file.read(num_elements * 4)
             arr = np.frombuffer(raw, dtype=np.float32)
         elif type_id == GGML_TYPE_F16:
-            raw = self.file.read(num_elements * 2)
             arr = np.frombuffer(raw, dtype=np.float16)
         elif type_id == GGML_TYPE_BF16:
-            raw = self.file.read(num_elements * 2)
             u16 = np.frombuffer(raw, dtype=np.uint16)
             arr = bf16_to_fp16_clamped(u16)
         else:
-            # Fallback reading raw bytes if needed
-            raw = self.file.read(num_elements * 2)
             arr = np.frombuffer(raw, dtype=np.float16)
 
         # In GGUF, 2D matrix dims are [cols, rows], so numpy shape is [rows, cols]
