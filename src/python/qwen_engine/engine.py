@@ -124,6 +124,22 @@ class Engine:
             cache_dir: Custom directory to store downloaded models.
             model_path: Alias for model_id_or_path.
         """
+        repo_id = kwargs.get("repo_id")
+        filename = kwargs.get("filename")
+        if repo_id and filename:
+            try:
+                from huggingface_hub import hf_hub_download
+                m_path = hf_hub_download(repo_id=repo_id, filename=filename, cache_dir=cache_dir)
+                t_path = tokenizer_path
+                if not t_path:
+                    try:
+                        t_path = hf_hub_download(repo_id=repo_id, filename="tokenizer.bin", cache_dir=cache_dir)
+                    except Exception:
+                        pass
+                return cls(model_path=m_path, tokenizer_path=t_path, device_id=device_id, device_ids=device_ids)
+            except ImportError:
+                pass
+
         target_model = model_path or model_id_or_path
         if target_model is None:
             raise ValueError("model_id_or_path or model_path must be provided.")
@@ -194,6 +210,7 @@ class Engine:
         max_tokens: int = 256,
         temperature: float = 0.0,
         sampling_params: Optional[SamplingParams] = None,
+        max_new_tokens: Optional[int] = None,
     ) -> str:
         """
         Run complete forward prefill and autoregressive decode, returning the text.
@@ -203,10 +220,13 @@ class Engine:
             max_tokens: Maximum number of new tokens to generate.
             temperature: Sampling temperature (0.0 = greedy argmax).
             sampling_params: Optional SamplingParams object overriding max_tokens/temperature.
+            max_new_tokens: Alias for max_tokens (Hugging Face / vLLM style).
 
         Returns:
             Decoded completion string.
         """
+        if max_new_tokens is not None:
+            max_tokens = max_new_tokens
         if sampling_params is not None:
             max_tokens = sampling_params.max_tokens
             temperature = sampling_params.temperature
@@ -244,6 +264,7 @@ class Engine:
         temperature: float = 0.0,
         rollback_on_interrupt: bool = True,
         sampling_params: Optional[SamplingParams] = None,
+        max_new_tokens: Optional[int] = None,
     ) -> Generator[str, None, None]:
         """
         Generate tokens as a streaming generator with multi-byte UTF-8 buffering.
@@ -258,10 +279,13 @@ class Engine:
             temperature: Sampling temperature (0.0 = greedy).
             rollback_on_interrupt: Whether to roll back KV cache if stream is closed early.
             sampling_params: Optional SamplingParams object overriding max_tokens/temperature.
+            max_new_tokens: Alias for max_tokens (Hugging Face / vLLM style).
 
         Yields:
             Decoded UTF-8 string fragments as tokens are generated.
         """
+        if max_new_tokens is not None:
+            max_tokens = max_new_tokens
         if sampling_params is not None:
             max_tokens = sampling_params.max_tokens
             temperature = sampling_params.temperature
@@ -356,3 +380,36 @@ class Engine:
                 yield piece
         finally:
             await asyncio.to_thread(gen.close)
+
+    # Aliases for Hugging Face / vLLM compatibility
+    stream_generate = stream
+
+    def __call__(
+        self,
+        prompt: Union[str, List[Dict[str, str]]],
+        stream: bool = False,
+        max_tokens: int = 256,
+        max_new_tokens: Optional[int] = None,
+        temperature: float = 0.0,
+        **kwargs,
+    ) -> Union[str, Generator[str, None, None]]:
+        """
+        Callable interface matching llama-cpp-python style:
+            for piece in engine("Hello", stream=True): ...
+            response = engine("Hello")
+        """
+        if stream:
+            return self.stream(
+                prompt,
+                max_tokens=max_tokens,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+        return self.generate(
+            prompt,
+            max_tokens=max_tokens,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            **kwargs,
+        )
