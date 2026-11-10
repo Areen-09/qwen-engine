@@ -158,6 +158,21 @@ class Engine:
         return self._engine.device_id()
 
     @property
+    def num_deltanet_layers(self) -> int:
+        """Number of linear DeltaNet recurrent attention layers."""
+        return self._engine.num_deltanet_layers()
+
+    @property
+    def num_gqa_layers(self) -> int:
+        """Number of full Generalized Query Attention (GQA) layers."""
+        return self._engine.num_gqa_layers()
+
+    @property
+    def current_token_id(self) -> int:
+        """Most recently generated token ID."""
+        return self._engine.current_token_id()
+
+    @property
     def current_seq_pos(self) -> int:
         """Current sequence position in the KV cache."""
         return self._engine.current_seq_pos()
