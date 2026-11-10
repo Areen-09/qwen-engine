@@ -139,54 +139,61 @@ __global__ void gemv_qkv_w4a8_kernel(
     QKVProjectionView view,
     const int8_t* __restrict__ input_q8,
     const float* __restrict__ input_scale,
-    const int32_t* __restrict__ input_sum8
+    const int32_t* __restrict__ input_sum8,
+    int in_features,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim
 ) {
-    constexpr int IN_FEATURES = HIDDEN_SIZE; // 1536
-    constexpr int NUM_GROUPS = IN_FEATURES / QUANT_GROUP_SIZE; // 12
-    constexpr int NUM_WARP_STEPS = IN_FEATURES / 256; // 6
+    int num_groups = in_features / QUANT_GROUP_SIZE;
+    int num_warp_steps = in_features / 256;
 
     extern __shared__ uint8_t s_mem[];
     int8_t* s_x_q8 = reinterpret_cast<int8_t*>(s_mem);
-    int32_t* s_x_sum8 = reinterpret_cast<int32_t*>(s_mem + IN_FEATURES);
-    float* s_x_scale = reinterpret_cast<float*>(s_mem + IN_FEATURES + (IN_FEATURES / 8) * sizeof(int32_t));
+    int32_t* s_x_sum8 = reinterpret_cast<int32_t*>(s_mem + in_features);
+    float* s_x_scale = reinterpret_cast<float*>(s_mem + in_features + (in_features / 8) * sizeof(int32_t));
 
     // Staging activations into shared memory
-    int num_u4 = IN_FEATURES / 16;
+    int num_u4 = in_features / 16;
     const uint4* in_q8_u4 = reinterpret_cast<const uint4*>(input_q8);
     uint4* s_q8_u4 = reinterpret_cast<uint4*>(s_x_q8);
     for (int i = threadIdx.x; i < num_u4; i += blockDim.x) {
         s_q8_u4[i] = in_q8_u4[i];
     }
-    int num_sum8 = IN_FEATURES / 8;
+    int num_sum8 = in_features / 8;
     for (int i = threadIdx.x; i < num_sum8; i += blockDim.x) {
         s_x_sum8[i] = input_sum8[i];
     }
-    for (int i = threadIdx.x; i < NUM_GROUPS; i += blockDim.x) {
+    for (int i = threadIdx.x; i < num_groups; i += blockDim.x) {
         s_x_scale[i] = input_scale[i];
     }
     __syncthreads();
 
-    // Resolve Q, K, or V based on blockIdx.x (128 blocks of 16 rows = 2048 rows)
+    int q_dim = num_q_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+    int q_blocks = q_dim / 16;
+    int k_blocks = kv_dim / 16;
+
     const uint32_t* qweight = nullptr;
     const half* scales = nullptr;
     half* output = nullptr;
     int row_offset = 0;
 
-    if (blockIdx.x < 96) { // Rows 0 .. 1535: Q
+    if (blockIdx.x < q_blocks) {
         qweight = reinterpret_cast<const uint32_t*>(view.q_weight);
         scales  = view.q_scale;
         output  = view.d_q;
         row_offset = 0;
-    } else if (blockIdx.x < 112) { // Rows 1536 .. 1791: K (0 .. 255)
+    } else if (blockIdx.x < q_blocks + k_blocks) {
         qweight = reinterpret_cast<const uint32_t*>(view.k_weight);
         scales  = view.k_scale;
         output  = view.d_k;
-        row_offset = 1536;
-    } else { // Rows 1792 .. 2047: V (0 .. 255)
+        row_offset = q_dim;
+    } else {
         qweight = reinterpret_cast<const uint32_t*>(view.v_weight);
         scales  = view.v_scale;
         output  = view.d_v;
-        row_offset = 1792;
+        row_offset = q_dim + kv_dim;
     }
 
     int warp_id = threadIdx.x / 32;
@@ -199,7 +206,7 @@ __global__ void gemv_qkv_w4a8_kernel(
 
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
 
-    for (int s = 0; s < NUM_WARP_STEPS; ++s) {
+    for (int s = 0; s < num_warp_steps; ++s) {
         int group_idx = 2 * s + (lane_id >> 4);
         int sub_lane = lane_id & 15;
         int sum8_idx = group_idx * 16 + sub_lane;
@@ -211,29 +218,29 @@ __global__ void gemv_qkv_w4a8_kernel(
         int32_t x_hi = x_pair.y;
         float x_d = s_x_scale[group_idx];
 
-        const uint32_t* row_qw0 = qweight + static_cast<size_t>(r0) * (IN_FEATURES / 8);
-        const half* row_scales0 = scales + static_cast<size_t>(r0) * NUM_GROUPS;
+        const uint32_t* row_qw0 = qweight + static_cast<size_t>(r0) * (in_features / 8);
+        const half* row_scales0 = scales + static_cast<size_t>(r0) * num_groups;
         uint32_t p0 = row_qw0[s * 32 + lane_id];
         int32_t dot0 = dp4a_w4_q8_oct(p0, x_lo, x_hi, x_sum8);
         float w_d0 = __half2float(row_scales0[group_idx]);
         acc0 += static_cast<float>(dot0) * (w_d0 * x_d);
 
-        const uint32_t* row_qw1 = qweight + static_cast<size_t>(r1) * (IN_FEATURES / 8);
-        const half* row_scales1 = scales + static_cast<size_t>(r1) * NUM_GROUPS;
+        const uint32_t* row_qw1 = qweight + static_cast<size_t>(r1) * (in_features / 8);
+        const half* row_scales1 = scales + static_cast<size_t>(r1) * num_groups;
         uint32_t p1 = row_qw1[s * 32 + lane_id];
         int32_t dot1 = dp4a_w4_q8_oct(p1, x_lo, x_hi, x_sum8);
         float w_d1 = __half2float(row_scales1[group_idx]);
         acc1 += static_cast<float>(dot1) * (w_d1 * x_d);
 
-        const uint32_t* row_qw2 = qweight + static_cast<size_t>(r2) * (IN_FEATURES / 8);
-        const half* row_scales2 = scales + static_cast<size_t>(r2) * NUM_GROUPS;
+        const uint32_t* row_qw2 = qweight + static_cast<size_t>(r2) * (in_features / 8);
+        const half* row_scales2 = scales + static_cast<size_t>(r2) * num_groups;
         uint32_t p2 = row_qw2[s * 32 + lane_id];
         int32_t dot2 = dp4a_w4_q8_oct(p2, x_lo, x_hi, x_sum8);
         float w_d2 = __half2float(row_scales2[group_idx]);
         acc2 += static_cast<float>(dot2) * (w_d2 * x_d);
 
-        const uint32_t* row_qw3 = qweight + static_cast<size_t>(r3) * (IN_FEATURES / 8);
-        const half* row_scales3 = scales + static_cast<size_t>(r3) * NUM_GROUPS;
+        const uint32_t* row_qw3 = qweight + static_cast<size_t>(r3) * (in_features / 8);
+        const half* row_scales3 = scales + static_cast<size_t>(r3) * num_groups;
         uint32_t p3 = row_qw3[s * 32 + lane_id];
         int32_t dot3 = dp4a_w4_q8_oct(p3, x_lo, x_hi, x_sum8);
         float w_d3 = __half2float(row_scales3[group_idx]);
@@ -633,16 +640,22 @@ void launch_gemv_qkv_w4a8(
     const int8_t* input_q8,
     const float* input_scale,
     const int32_t* input_sum8,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int in_features,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim
 ) {
     constexpr int BLOCK_THREADS = 128;
-    constexpr int TOTAL_ROWS = Q_DIM + 2 * KV_DIM; // 2048
+    int q_dim = num_q_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+    int total_rows = q_dim + 2 * kv_dim;
     constexpr int ROWS_PER_BLOCK = 16;
-    constexpr int GRID = TOTAL_ROWS / ROWS_PER_BLOCK; // 128 blocks
-    size_t smem = static_cast<size_t>(HIDDEN_SIZE) * 49 / 32;
+    int grid = (total_rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+    size_t smem = static_cast<size_t>(in_features) * 49 / 32;
 
-    gemv_qkv_w4a8_kernel<<<GRID, BLOCK_THREADS, smem, stream>>>(
-        view, input_q8, input_scale, input_sum8
+    gemv_qkv_w4a8_kernel<<<grid, BLOCK_THREADS, smem, stream>>>(
+        view, input_q8, input_scale, input_sum8, in_features, num_q_heads, num_kv_heads, head_dim
     );
     CUDA_KERNEL_CHECK();
 }

@@ -1,6 +1,7 @@
 #include "config.cuh"
 #include "tensor.cuh"
 #include "kernels.cuh"
+#include "deltanet.cuh"
 #include "engine.cuh"
 
 #include <iostream>
@@ -11,10 +12,14 @@
 #include <cassert>
 #include <algorithm>
 #include <memory>
+#include <random>
 
 using namespace qwen;
 
-// Metric evaluation helpers
+// ============================================================================
+// Numerical Evaluation Helpers
+// ============================================================================
+
 static float compute_max_abs_err(const half* a, const half* b, size_t n) {
     float max_err = 0.0f;
     for (size_t i = 0; i < n; ++i) {
@@ -39,39 +44,638 @@ static float compute_cosine_similarity(const half* a, const half* b, size_t n) {
     return static_cast<float>(dot / (std::sqrt(norm_a) * std::sqrt(norm_b)));
 }
 
-int main(int argc, char** argv) {
-    std::string golden_path = "models/golden_ref.bin";
-    std::string fp16_path   = "models/qwen25_1.5b_fp16.qwenbin";
-    std::string w4a16_path  = "models/qwen25_1.5b_w4a16.qwenbin";
+static bool check_has_nan_or_inf(const half* data, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        float f = __half2float(data[i]);
+        if (std::isnan(f) || std::isinf(f)) return true;
+    }
+    return false;
+}
 
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--golden" && i + 1 < argc) golden_path = argv[++i];
-        else if (arg == "--fp16" && i + 1 < argc) fp16_path = argv[++i];
-        else if (arg == "--w4a16" && i + 1 < argc) w4a16_path = argv[++i];
+// ============================================================================
+// Standalone Synthetic Mathematical Suites (Zero File Dependencies)
+// ============================================================================
+
+// [Synthetic Suite 1] RMSNorm FP16 Suite
+bool run_synthetic_rmsnorm_suite() {
+    std::cout << "\n[Synthetic Suite 1] Testing Standalone RMSNorm (FP16, H=1536)..." << std::endl;
+    constexpr int H = 1536;
+    constexpr int num_tokens = 8;
+    size_t total_elements = static_cast<size_t>(num_tokens) * H;
+
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dis_in(-1.0f, 1.0f);
+    std::uniform_real_distribution<float> dis_gamma(0.8f, 1.2f);
+
+    std::vector<half> h_in(total_elements);
+    std::vector<half> h_gamma(H);
+    std::vector<half> h_cpu_ref(total_elements);
+    std::vector<half> h_gpu_out(total_elements);
+
+    for (size_t i = 0; i < total_elements; ++i) {
+        h_in[i] = __float2half(dis_in(gen));
+    }
+    for (int i = 0; i < H; ++i) {
+        h_gamma[i] = __float2half(dis_gamma(gen));
     }
 
-    std::cout << "========================================================" << std::endl;
-    std::cout << "   Qwen2.5-1.5B CUDA Inference Engine Test Suite        " << std::endl;
+    // CPU reference matching the GPU kernel's two-stage FP16 multiplication
+    for (int t = 0; t < num_tokens; ++t) {
+        const half* in_tok = h_in.data() + t * H;
+        half* out_tok = h_cpu_ref.data() + t * H;
+        double sum_sq = 0.0;
+        for (int i = 0; i < H; ++i) {
+            float v = __half2float(in_tok[i]);
+            sum_sq += static_cast<double>(v * v);
+        }
+        float inv_rms = 1.0f / std::sqrt(static_cast<float>(sum_sq / static_cast<double>(H) + static_cast<double>(RMS_NORM_EPS)));
+        half inv_rms_h = __float2half(inv_rms);
+        for (int i = 0; i < H; ++i) {
+            half norm_val = __hmul(in_tok[i], inv_rms_h);
+            out_tok[i] = __hmul(norm_val, h_gamma[i]);
+        }
+    }
+
+    half *d_in = nullptr, *d_gamma = nullptr, *d_out = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_in, total_elements * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_gamma, H * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_out, total_elements * sizeof(half)));
+
+    CUDA_CHECK(cudaMemcpy(d_in, h_in.data(), total_elements * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_gamma, h_gamma.data(), H * sizeof(half), cudaMemcpyHostToDevice));
+
+    launch_rmsnorm_fp16(d_in, d_gamma, d_out, num_tokens, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(h_gpu_out.data(), d_out, total_elements * sizeof(half), cudaMemcpyDeviceToHost));
+
+    cudaFree(d_in);
+    cudaFree(d_gamma);
+    cudaFree(d_out);
+
+    float max_err = compute_max_abs_err(h_gpu_out.data(), h_cpu_ref.data(), total_elements);
+    bool has_nan = check_has_nan_or_inf(h_gpu_out.data(), total_elements);
+
+    std::cout << "  - Max Abs Error: " << max_err << " (threshold: <= 1e-3)" << std::endl;
+    if (has_nan || max_err > 1e-3f) {
+        std::cerr << "  FAILED: Synthetic RMSNorm error " << max_err << " exceeds threshold or has NaN/Inf!" << std::endl;
+        return false;
+    }
+    std::cout << "  [PASSED] Synthetic RMSNorm parity verified." << std::endl;
+    return true;
+}
+
+// [Synthetic Suite 2] Rotary Position Embeddings (NeoX RoPE)
+bool run_synthetic_rope_suite() {
+    std::cout << "\n[Synthetic Suite 2] Testing Standalone Rotary Position Embeddings (NeoX RoPE)..." << std::endl;
+    constexpr int num_tokens = 4;
+    constexpr int head_dim = 128;
+    constexpr int q_dim = NUM_Q_HEADS * head_dim;    // 12 * 128 = 1536
+    constexpr int kv_dim = NUM_KV_HEADS * head_dim;  // 2 * 128 = 256
+
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+
+    std::vector<half> h_q(num_tokens * q_dim);
+    std::vector<half> h_k(num_tokens * kv_dim);
+    std::vector<half> h_v(num_tokens * kv_dim);
+    std::vector<half> h_q_ref(num_tokens * q_dim);
+    std::vector<half> h_k_ref(num_tokens * kv_dim);
+
+    for (size_t i = 0; i < h_q.size(); ++i) h_q[i] = __float2half(dis(gen));
+    for (size_t i = 0; i < h_k.size(); ++i) h_k[i] = __float2half(dis(gen));
+    for (size_t i = 0; i < h_v.size(); ++i) h_v[i] = __float2half(dis(gen));
+    h_q_ref = h_q;
+    h_k_ref = h_k;
+
+    std::vector<half> zero_q_bias(q_dim, __float2half(0.0f));
+    std::vector<half> zero_kv_bias(kv_dim, __float2half(0.0f));
+
+    // Analytic trigonometric reference on CPU for seq_pos = 0 .. num_tokens-1
+    for (int m = 0; m < num_tokens; ++m) {
+        int pos = m;
+        // Q heads
+        for (int h = 0; h < NUM_Q_HEADS; ++h) {
+            half* head_ptr = h_q_ref.data() + m * q_dim + h * head_dim;
+            for (int coord_i = 0; coord_i < head_dim / 2; ++coord_i) {
+                float exponent = -2.0f * static_cast<float>(coord_i) / static_cast<float>(head_dim);
+                float theta = std::exp2(exponent * LOG2_ROPE_THETA);
+                float angle = static_cast<float>(pos) * theta;
+                float sin_val = std::sin(angle);
+                float cos_val = std::cos(angle);
+                float x0 = __half2float(head_ptr[coord_i]);
+                float x1 = __half2float(head_ptr[coord_i + head_dim / 2]);
+                head_ptr[coord_i] = __float2half(x0 * cos_val - x1 * sin_val);
+                head_ptr[coord_i + head_dim / 2] = __float2half(x0 * sin_val + x1 * cos_val);
+            }
+        }
+        // K heads
+        for (int h = 0; h < NUM_KV_HEADS; ++h) {
+            half* head_ptr = h_k_ref.data() + m * kv_dim + h * head_dim;
+            for (int coord_i = 0; coord_i < head_dim / 2; ++coord_i) {
+                float exponent = -2.0f * static_cast<float>(coord_i) / static_cast<float>(head_dim);
+                float theta = std::exp2(exponent * LOG2_ROPE_THETA);
+                float angle = static_cast<float>(pos) * theta;
+                float sin_val = std::sin(angle);
+                float cos_val = std::cos(angle);
+                float x0 = __half2float(head_ptr[coord_i]);
+                float x1 = __half2float(head_ptr[coord_i + head_dim / 2]);
+                head_ptr[coord_i] = __float2half(x0 * cos_val - x1 * sin_val);
+                head_ptr[coord_i + head_dim / 2] = __float2half(x0 * sin_val + x1 * cos_val);
+            }
+        }
+    }
+
+    half *d_q = nullptr, *d_k = nullptr, *d_v = nullptr;
+    half *d_qb = nullptr, *d_kb = nullptr, *d_vb = nullptr;
+    half *d_kc = nullptr, *d_vc = nullptr;
+    DeviceControlBlock* d_dcb = nullptr;
+
+    CUDA_CHECK(cudaMalloc(&d_q, h_q.size() * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_k, h_k.size() * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_v, h_v.size() * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_qb, q_dim * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_kb, kv_dim * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_vb, kv_dim * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_kc, NUM_KV_HEADS * MAX_SEQ_LEN * head_dim * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_vc, NUM_KV_HEADS * MAX_SEQ_LEN * head_dim * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_dcb, sizeof(DeviceControlBlock)));
+
+    CUDA_CHECK(cudaMemcpy(d_q, h_q.data(), h_q.size() * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_k, h_k.data(), h_k.size() * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_v, h_v.data(), h_v.size() * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_qb, zero_q_bias.data(), q_dim * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_kb, zero_kv_bias.data(), kv_dim * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_vb, zero_kv_bias.data(), kv_dim * sizeof(half), cudaMemcpyHostToDevice));
+
+    DeviceControlBlock dcb = {0, 0, 0.0f, 0, 0};
+    CUDA_CHECK(cudaMemcpy(d_dcb, &dcb, sizeof(DeviceControlBlock), cudaMemcpyHostToDevice));
+
+    launch_qkv_bias_rope_kv_append(d_q, d_k, d_v, d_qb, d_kb, d_vb, d_kc, d_vc, d_dcb, num_tokens, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<half> h_gpu_q(h_q.size());
+    std::vector<half> h_gpu_k(h_k.size());
+    CUDA_CHECK(cudaMemcpy(h_gpu_q.data(), d_q, h_q.size() * sizeof(half), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_gpu_k.data(), d_k, h_k.size() * sizeof(half), cudaMemcpyDeviceToHost));
+
+    cudaFree(d_q); cudaFree(d_k); cudaFree(d_v);
+    cudaFree(d_qb); cudaFree(d_kb); cudaFree(d_vb);
+    cudaFree(d_kc); cudaFree(d_vc); cudaFree(d_dcb);
+
+    float err_q = compute_max_abs_err(h_gpu_q.data(), h_q_ref.data(), h_q.size());
+    float err_k = compute_max_abs_err(h_gpu_k.data(), h_k_ref.data(), h_k.size());
+    bool has_nan_q = check_has_nan_or_inf(h_gpu_q.data(), h_q.size());
+    bool has_nan_k = check_has_nan_or_inf(h_gpu_k.data(), h_k.size());
+
+    std::cout << "  - Q RoPE Max Abs Error: " << err_q << " (threshold: <= 1e-3)" << std::endl;
+    std::cout << "  - K RoPE Max Abs Error: " << err_k << " (threshold: <= 1e-3)" << std::endl;
+
+    if (has_nan_q || has_nan_k || err_q > 1e-3f || err_k > 1e-3f) {
+        std::cerr << "  FAILED: Synthetic RoPE error exceeds threshold or has NaN/Inf!" << std::endl;
+        return false;
+    }
+    std::cout << "  [PASSED] Synthetic RoPE trigonometric accuracy verified." << std::endl;
+    return true;
+}
+
+// [Synthetic Suite 3] Dynamic Dimension Sweeps for GEMV & SwiGLU (FP16 & W4A16)
+bool run_synthetic_gemv_swiglu_suite() {
+    std::cout << "\n[Synthetic Suite 3] Testing Dynamic Dimension Sweeps for GEMV & SwiGLU..." << std::endl;
+
+    struct DimPair {
+        int H;
+        int I;
+        const char* label;
+    };
+
+    std::vector<DimPair> pairs = {
+        {1536, 8960,  "1.5B Scale (H=1536, I=8960)"},
+        {2560, 10240, "4B Scale   (H=2560, I=10240)"},
+        {5120, 27648, "27B Scale  (H=5120, I=27648)"},
+        {256,  512,   "Small Scale (H=256, I=512)"}
+    };
+
+    bool all_pairs_passed = true;
+
+    for (const auto& pair : pairs) {
+        int H = pair.H;
+        int I = pair.I;
+        std::cout << "\n  --- Dimension Sweep: " << pair.label << " ---" << std::endl;
+
+        std::mt19937 gen(42 + H);
+        float scale_factor = 1.0f / std::sqrt(static_cast<float>(H));
+        std::uniform_real_distribution<float> dis_x(-scale_factor, scale_factor);
+        std::uniform_real_distribution<float> dis_w(-scale_factor, scale_factor);
+
+        // 1. Prepare input_x
+        std::vector<half> h_x(H);
+        for (int i = 0; i < H; ++i) h_x[i] = __float2half(dis_x(gen));
+
+        half *d_x = nullptr, *d_out = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_x, H * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_out, I * sizeof(half)));
+        CUDA_CHECK(cudaMemcpy(d_x, h_x.data(), H * sizeof(half), cudaMemcpyHostToDevice));
+
+        // ====================================================================
+        // FP16 SwiGLU verification
+        // ====================================================================
+        {
+            size_t num_w_elements = static_cast<size_t>(2 * I) * H;
+            std::vector<half> h_gate_up_fp16(num_w_elements);
+            for (size_t i = 0; i < num_w_elements; ++i) {
+                h_gate_up_fp16[i] = __float2half(dis_w(gen));
+            }
+
+            // CPU reference for FP16 SwiGLU
+            std::vector<half> h_cpu_ref_fp16(I);
+            for (int r = 0; r < I; ++r) {
+                const half* g_row = h_gate_up_fp16.data() + static_cast<size_t>(2 * r + 0) * H;
+                const half* u_row = h_gate_up_fp16.data() + static_cast<size_t>(2 * r + 1) * H;
+                double g_acc = 0.0;
+                double u_acc = 0.0;
+                for (int c = 0; c < H; ++c) {
+                    double x_val = static_cast<double>(__half2float(h_x[c]));
+                    g_acc += static_cast<double>(__half2float(g_row[c])) * x_val;
+                    u_acc += static_cast<double>(__half2float(u_row[c])) * x_val;
+                }
+                double silu = g_acc / (1.0 + std::exp(-g_acc));
+                h_cpu_ref_fp16[r] = __float2half(static_cast<float>(silu * u_acc));
+            }
+
+            half* d_gate_up_fp16 = nullptr;
+            CUDA_CHECK(cudaMalloc(&d_gate_up_fp16, num_w_elements * sizeof(half)));
+            CUDA_CHECK(cudaMemcpy(d_gate_up_fp16, h_gate_up_fp16.data(), num_w_elements * sizeof(half), cudaMemcpyHostToDevice));
+
+            launch_gemv_dual_gate_up_swiglu_fp16(d_gate_up_fp16, d_x, d_out, H, I, nullptr);
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            std::vector<half> h_gpu_out_fp16(I);
+            CUDA_CHECK(cudaMemcpy(h_gpu_out_fp16.data(), d_out, I * sizeof(half), cudaMemcpyDeviceToHost));
+            cudaFree(d_gate_up_fp16);
+
+            float err_fp16 = compute_max_abs_err(h_gpu_out_fp16.data(), h_cpu_ref_fp16.data(), I);
+            bool nan_fp16 = check_has_nan_or_inf(h_gpu_out_fp16.data(), I);
+            std::cout << "    [FP16] Max Abs Error: " << err_fp16 << " (threshold: <= 5e-3)" << std::endl;
+
+            if (nan_fp16 || err_fp16 > 5e-3f) {
+                std::cerr << "    FAILED: FP16 SwiGLU error exceeds 5e-3 or has NaN/Inf on " << pair.label << "!" << std::endl;
+                all_pairs_passed = false;
+            }
+        }
+
+        // ====================================================================
+        // W4A16 SwiGLU verification
+        // ====================================================================
+        {
+            int num_groups = H / 128;
+            size_t num_qwords = static_cast<size_t>(2 * I) * (H / 8);
+            size_t num_scales = static_cast<size_t>(2 * I) * num_groups;
+
+            std::vector<uint32_t> h_qweight(num_qwords);
+            std::vector<half> h_scales(num_scales);
+
+            std::uniform_int_distribution<int> dis_nibble(2, 14);
+            for (size_t i = 0; i < num_qwords; ++i) {
+                uint32_t q0 = dis_nibble(gen);
+                uint32_t q1 = dis_nibble(gen);
+                uint32_t q2 = dis_nibble(gen);
+                uint32_t q3 = dis_nibble(gen);
+                uint32_t q4 = dis_nibble(gen);
+                uint32_t q5 = dis_nibble(gen);
+                uint32_t q6 = dis_nibble(gen);
+                uint32_t q7 = dis_nibble(gen);
+                h_qweight[i] = (q0) | (q4 << 4) | (q1 << 8) | (q5 << 12) |
+                               (q2 << 16) | (q6 << 20) | (q3 << 24) | (q7 << 28);
+            }
+            float sc_val = 0.05f * scale_factor;
+            for (size_t i = 0; i < num_scales; ++i) {
+                h_scales[i] = __float2half(sc_val);
+            }
+
+            // CPU reference simulating Q8_1 quantization and W4 dot product
+            std::vector<float> x_scale(num_groups);
+            std::vector<int8_t> x_q(H);
+            for (int g = 0; g < num_groups; ++g) {
+                float max_abs = 0.0f;
+                for (int j = 0; j < 128; ++j) {
+                    float val = std::abs(__half2float(h_x[g * 128 + j]));
+                    if (val > max_abs) max_abs = val;
+                }
+                float d = std::max(max_abs / 127.0f, 1e-8f);
+                x_scale[g] = d;
+                float inv_d = 1.0f / d;
+                for (int j = 0; j < 128; ++j) {
+                    float val = __half2float(h_x[g * 128 + j]) * inv_d;
+                    int v = static_cast<int>(std::round(val));
+                    v = std::max(-127, std::min(127, v));
+                    x_q[g * 128 + j] = static_cast<int8_t>(v);
+                }
+            }
+
+            std::vector<half> h_cpu_ref_w4(I);
+            for (int r = 0; r < I; ++r) {
+                auto eval_row = [&](int row_idx) -> double {
+                    const uint32_t* row_qw = h_qweight.data() + static_cast<size_t>(row_idx) * (H / 8);
+                    const half* row_sc = h_scales.data() + static_cast<size_t>(row_idx) * num_groups;
+                    double acc = 0.0;
+                    for (int g = 0; g < num_groups; ++g) {
+                        float w_sc = __half2float(row_sc[g]);
+                        float group_factor = w_sc * x_scale[g];
+                        int32_t group_dot = 0;
+                        for (int w = 0; w < 16; ++w) {
+                            uint32_t packed = row_qw[g * 16 + w];
+                            int q[8];
+                            q[0] = (packed >> 0)  & 0xF;
+                            q[4] = (packed >> 4)  & 0xF;
+                            q[1] = (packed >> 8)  & 0xF;
+                            q[5] = (packed >> 12) & 0xF;
+                            q[2] = (packed >> 16) & 0xF;
+                            q[6] = (packed >> 20) & 0xF;
+                            q[3] = (packed >> 24) & 0xF;
+                            q[7] = (packed >> 28) & 0xF;
+                            for (int j = 0; j < 8; ++j) {
+                                int8_t x_val = x_q[g * 128 + w * 8 + j];
+                                group_dot += (q[j] - 8) * static_cast<int32_t>(x_val);
+                            }
+                        }
+                        acc += static_cast<double>(group_dot) * static_cast<double>(group_factor);
+                    }
+                    return acc;
+                };
+
+                double g_acc = eval_row(2 * r + 0);
+                double u_acc = eval_row(2 * r + 1);
+                double silu = g_acc / (1.0 + std::exp(-g_acc));
+                h_cpu_ref_w4[r] = __float2half(static_cast<float>(silu * u_acc));
+            }
+
+            uint32_t* d_gate_up_w4 = nullptr;
+            half* d_gate_up_scales = nullptr;
+            CUDA_CHECK(cudaMalloc(&d_gate_up_w4, num_qwords * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc(&d_gate_up_scales, num_scales * sizeof(half)));
+
+            CUDA_CHECK(cudaMemcpy(d_gate_up_w4, h_qweight.data(), num_qwords * sizeof(uint32_t), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_gate_up_scales, h_scales.data(), num_scales * sizeof(half), cudaMemcpyHostToDevice));
+
+            launch_gemv_dual_gate_up_swiglu_w4a16(d_gate_up_w4, d_gate_up_scales, d_x, d_out, H, I, nullptr);
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            std::vector<half> h_gpu_out_w4(I);
+            CUDA_CHECK(cudaMemcpy(h_gpu_out_w4.data(), d_out, I * sizeof(half), cudaMemcpyDeviceToHost));
+
+            cudaFree(d_gate_up_w4);
+            cudaFree(d_gate_up_scales);
+
+            float err_w4 = compute_max_abs_err(h_gpu_out_w4.data(), h_cpu_ref_w4.data(), I);
+            bool nan_w4 = check_has_nan_or_inf(h_gpu_out_w4.data(), I);
+            std::cout << "    [W4A16] Max Abs Error: " << err_w4 << " (threshold: <= 5e-3)" << std::endl;
+
+            if (nan_w4 || err_w4 > 5e-3f) {
+                std::cerr << "    FAILED: W4A16 SwiGLU error exceeds 5e-3 or has NaN/Inf on " << pair.label << "!" << std::endl;
+                all_pairs_passed = false;
+            }
+        }
+
+        cudaFree(d_x);
+        cudaFree(d_out);
+    }
+
+    if (all_pairs_passed) {
+        std::cout << "  [PASSED] Dynamic dimension sweeps verified across all scales." << std::endl;
+        return true;
+    } else {
+        std::cerr << "  FAILED: Some dynamic dimension sweeps failed!" << std::endl;
+        return false;
+    }
+}
+
+// [Synthetic Suite 4] Standalone Gated DeltaNet Recurrence Suite
+bool run_synthetic_deltanet_suite() {
+    std::cout << "\n[Synthetic Suite 4] Testing Standalone Gated DeltaNet Recurrence (sm_75)..." << std::endl;
+    constexpr int batch_size = 1;
+    constexpr int num_heads = 4;
+    constexpr int head_dim = 128;
+    constexpr size_t state_elements = static_cast<size_t>(batch_size) * num_heads * head_dim * head_dim; // 65536
+    constexpr size_t vector_elements = static_cast<size_t>(batch_size) * num_heads * head_dim;           // 512
+
+    std::vector<int> seq_lengths = {1, 4, 16, 64};
+    bool all_t_passed = true;
+
+    half *d_q = nullptr, *d_k = nullptr, *d_v = nullptr, *d_beta = nullptr, *d_out = nullptr;
+    float *d_state = nullptr;
+
+    CUDA_CHECK(cudaMalloc(&d_q, vector_elements * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_k, vector_elements * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_v, vector_elements * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_beta, num_heads * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_out, vector_elements * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_state, state_elements * sizeof(float)));
+
+    for (int T : seq_lengths) {
+        std::cout << "  - Evaluating recurrence across sequence length T=" << T << "..." << std::endl;
+        CUDA_CHECK(cudaMemset(d_state, 0, state_elements * sizeof(float)));
+
+        std::vector<double> ref_state(state_elements, 0.0);
+        std::mt19937 gen(42 + T);
+        std::uniform_real_distribution<float> dis_vec(-0.2f, 0.2f);
+        std::uniform_real_distribution<float> dis_beta(-1.0f, 1.0f);
+
+        std::vector<half> h_q(vector_elements);
+        std::vector<half> h_k(vector_elements);
+        std::vector<half> h_v(vector_elements);
+        std::vector<half> h_beta(num_heads);
+        std::vector<half> h_cpu_out(vector_elements);
+        std::vector<half> h_gpu_out(vector_elements);
+
+        float max_step_err = 0.0f;
+        float min_step_cos = 1.0f;
+
+        for (int t = 0; t < T; ++t) {
+            for (size_t i = 0; i < vector_elements; ++i) {
+                h_q[i] = __float2half(dis_vec(gen));
+                h_k[i] = __float2half(dis_vec(gen));
+                h_v[i] = __float2half(dis_vec(gen));
+            }
+            for (int h = 0; h < num_heads; ++h) {
+                h_beta[h] = __float2half(dis_beta(gen));
+            }
+
+            // CPU reference recurrence:
+            // alpha = 1 / (1 + exp(beta))
+            // S_t = alpha * S_{t-1} + v_t * k_t^T
+            // o_t = S_t * q_t
+            for (int h = 0; h < num_heads; ++h) {
+                double beta_val = static_cast<double>(__half2float(h_beta[h]));
+                double alpha = 1.0 / (1.0 + std::exp(beta_val));
+
+                for (int r = 0; r < head_dim; ++r) {
+                    double v_val = static_cast<double>(__half2float(h_v[h * head_dim + r]));
+                    for (int c = 0; c < head_dim; ++c) {
+                        double k_val = static_cast<double>(__half2float(h_k[h * head_dim + c]));
+                        size_t idx = static_cast<size_t>(h * head_dim + r) * head_dim + c;
+                        ref_state[idx] = alpha * ref_state[idx] + v_val * k_val;
+                    }
+                }
+
+                for (int r = 0; r < head_dim; ++r) {
+                    double sum_prod = 0.0;
+                    for (int c = 0; c < head_dim; ++c) {
+                        double q_val = static_cast<double>(__half2float(h_q[h * head_dim + c]));
+                        size_t idx = static_cast<size_t>(h * head_dim + r) * head_dim + c;
+                        sum_prod += ref_state[idx] * q_val;
+                    }
+                    h_cpu_out[h * head_dim + r] = __float2half(static_cast<float>(sum_prod));
+                }
+            }
+
+            CUDA_CHECK(cudaMemcpy(d_q, h_q.data(), vector_elements * sizeof(half), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_k, h_k.data(), vector_elements * sizeof(half), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_v, h_v.data(), vector_elements * sizeof(half), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_beta, h_beta.data(), num_heads * sizeof(half), cudaMemcpyHostToDevice));
+
+            launch_deltanet_decode_sm75(d_q, d_k, d_v, d_beta, d_state, d_out, batch_size, num_heads, head_dim, nullptr);
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            CUDA_CHECK(cudaMemcpy(h_gpu_out.data(), d_out, vector_elements * sizeof(half), cudaMemcpyDeviceToHost));
+
+            float step_err = compute_max_abs_err(h_gpu_out.data(), h_cpu_out.data(), vector_elements);
+            float step_cos = compute_cosine_similarity(h_gpu_out.data(), h_cpu_out.data(), vector_elements);
+
+            if (step_err > max_step_err) max_step_err = step_err;
+            if (step_cos < min_step_cos) min_step_cos = step_cos;
+        }
+
+        std::cout << "    T=" << T << " Max Abs Error: " << max_step_err << " (threshold: <= 1e-3), Min Cos Sim: " << min_step_cos << " (threshold: >= 0.9999)" << std::endl;
+        if (max_step_err > 1e-3f || min_step_cos < 0.9999f) {
+            std::cerr << "    FAILED: DeltaNet parity exceeded tolerance on T=" << T << "!" << std::endl;
+            all_t_passed = false;
+        }
+    }
+
+    cudaFree(d_q); cudaFree(d_k); cudaFree(d_v);
+    cudaFree(d_beta); cudaFree(d_out); cudaFree(d_state);
+
+    if (all_t_passed) {
+        std::cout << "  [PASSED] Synthetic Gated DeltaNet recurrence parity verified." << std::endl;
+        return true;
+    } else {
+        std::cerr << "  FAILED: Synthetic DeltaNet recurrence failed!" << std::endl;
+        return false;
+    }
+}
+
+// [Synthetic Suite 5] Standalone Depthwise Conv1d Suite
+bool run_synthetic_conv1d_suite() {
+    std::cout << "\n[Synthetic Suite 5] Testing Standalone Depthwise Conv1d Steps (C=2560, K=4)..." << std::endl;
+    constexpr int C = 2560;
+    constexpr int K = 4;
+    constexpr int history_len = K - 1; // 3
+    constexpr int num_steps = 8;
+
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dis_val(-0.5f, 0.5f);
+
+    std::vector<half> h_weight(C * K);
+    std::vector<half> h_bias(C);
+    std::vector<half> h_cpu_state(C * history_len, __float2half(0.0f));
+
+    for (size_t i = 0; i < h_weight.size(); ++i) h_weight[i] = __float2half(dis_val(gen));
+    for (size_t i = 0; i < h_bias.size(); ++i) h_bias[i] = __float2half(dis_val(gen));
+
+    half *d_in = nullptr, *d_weight = nullptr, *d_bias = nullptr, *d_conv_state = nullptr, *d_out = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_in, C * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_weight, C * K * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_bias, C * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_conv_state, C * history_len * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_out, C * sizeof(half)));
+
+    CUDA_CHECK(cudaMemset(d_conv_state, 0, C * history_len * sizeof(half)));
+    CUDA_CHECK(cudaMemcpy(d_weight, h_weight.data(), C * K * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_bias, h_bias.data(), C * sizeof(half), cudaMemcpyHostToDevice));
+
+    std::vector<half> h_in(C);
+    std::vector<half> h_cpu_out(C);
+    std::vector<half> h_gpu_out(C);
+
+    float max_err = 0.0f;
+
+    for (int step = 0; step < num_steps; ++step) {
+        for (int c = 0; c < C; ++c) h_in[c] = __float2half(dis_val(gen));
+
+        // CPU reference
+        for (int c = 0; c < C; ++c) {
+            double in_elem = static_cast<double>(__half2float(h_in[c]));
+            const half* w_c = h_weight.data() + c * K;
+            half* st_c = h_cpu_state.data() + c * history_len;
+
+            double acc = in_elem * static_cast<double>(__half2float(w_c[0]));
+            for (int k = 0; k < history_len; ++k) {
+                acc += static_cast<double>(__half2float(st_c[k])) * static_cast<double>(__half2float(w_c[k + 1]));
+            }
+            acc += static_cast<double>(__half2float(h_bias[c]));
+
+            // Shift state
+            for (int k = history_len - 1; k > 0; --k) {
+                st_c[k] = st_c[k - 1];
+            }
+            st_c[0] = h_in[c];
+
+            double silu_val = acc / (1.0 + std::exp(-acc));
+            h_cpu_out[c] = __float2half(static_cast<float>(silu_val));
+        }
+
+        CUDA_CHECK(cudaMemcpy(d_in, h_in.data(), C * sizeof(half), cudaMemcpyHostToDevice));
+        launch_depthwise_conv1d_step(d_in, d_weight, d_bias, d_conv_state, d_out, C, K, nullptr);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        CUDA_CHECK(cudaMemcpy(h_gpu_out.data(), d_out, C * sizeof(half), cudaMemcpyDeviceToHost));
+
+        float step_err = compute_max_abs_err(h_gpu_out.data(), h_cpu_out.data(), C);
+        if (step_err > max_err) max_err = step_err;
+    }
+
+    cudaFree(d_in); cudaFree(d_weight); cudaFree(d_bias);
+    cudaFree(d_conv_state); cudaFree(d_out);
+
+    std::cout << "  - Conv1d Steps Max Abs Error: " << max_err << " (threshold: <= 5e-3)" << std::endl;
+    if (max_err > 5e-3f) {
+        std::cerr << "  FAILED: Synthetic Depthwise Conv1d error exceeds threshold!" << std::endl;
+        return false;
+    }
+    std::cout << "  [PASSED] Synthetic Depthwise Conv1d step parity verified." << std::endl;
+    return true;
+}
+
+// ============================================================================
+// Golden Reference Parity Suite (Opt-In with --golden <path>)
+// ============================================================================
+
+bool run_golden_reference_suite(
+    const std::string& golden_path,
+    const std::string& fp16_path,
+    const std::string& w4a16_path
+) {
+    std::cout << "\n========================================================" << std::endl;
+    std::cout << "   Golden Reference Verification Suite                  " << std::endl;
     std::cout << "========================================================" << std::endl;
     std::cout << "Golden Reference: " << golden_path << std::endl;
     std::cout << "FP16 Model:       " << fp16_path << std::endl;
     std::cout << "W4A16 Model:      " << w4a16_path << std::endl;
     std::cout << "--------------------------------------------------------" << std::endl;
 
-    // 1. Read Golden Reference Header and Tensors
     std::ifstream gfile(golden_path, std::ios::binary);
     if (!gfile.is_open()) {
         std::cerr << "[ERROR] Cannot open golden reference file: " << golden_path << std::endl;
         std::cerr << "Run 'python tools/verify_reference.py' first!" << std::endl;
-        return 1;
+        return false;
     }
 
     GoldenRefHeader g_header;
     gfile.read(reinterpret_cast<char*>(&g_header), sizeof(g_header));
     if (g_header.magic != 0x474F4C44) {
         std::cerr << "[ERROR] Invalid golden reference magic: 0x" << std::hex << g_header.magic << std::endl;
-        return 1;
+        return false;
     }
 
     auto read_ref_tensor = [&](int idx, size_t num_elements, size_t elem_size) -> std::vector<char> {
@@ -428,7 +1032,7 @@ int main(int argc, char** argv) {
         }
 
         std::cout << "[Test] Unloading FP16 engine and freeing ~3088 MB VRAM..." << std::endl;
-    } // engine_fp16 goes out of scope here and deallocates its arena
+    }
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // ========================================================================
@@ -602,7 +1206,7 @@ int main(int argc, char** argv) {
         }
 
         std::cout << "[Test] Unloading W4A16 engine and freeing ~903 MB VRAM..." << std::endl;
-    } // engine_w4a16 goes out of scope here
+    }
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Cleanup common scratch buffers
@@ -613,13 +1217,61 @@ int main(int argc, char** argv) {
     cudaFree(d_test_k);
     cudaFree(d_test_v);
 
+    return all_passed;
+}
+
+// ============================================================================
+// Main Dispatcher
+// ============================================================================
+
+int main(int argc, char** argv) {
+    bool run_golden = false;
+    std::string golden_path = "models/golden_ref.bin";
+    std::string fp16_path   = "models/qwen25_1.5b_fp16.qwenbin";
+    std::string w4a16_path  = "models/qwen25_1.5b_w4a16.qwenbin";
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--golden") {
+            run_golden = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                golden_path = argv[++i];
+            }
+        }
+        else if (arg == "--fp16" && i + 1 < argc) fp16_path = argv[++i];
+        else if (arg == "--w4a16" && i + 1 < argc) w4a16_path = argv[++i];
+    }
+
+    std::cout << "========================================================" << std::endl;
+    std::cout << "   Qwen Inference Engine Multi-Model Test Suite         " << std::endl;
+    std::cout << "========================================================" << std::endl;
+
+    bool all_passed = true;
+
+    // Unconditionally execute all standalone synthetic unit tests
+    std::cout << "\n>>> Executing Standalone Synthetic Mathematical Suites..." << std::endl;
+
+    if (!run_synthetic_rmsnorm_suite()) all_passed = false;
+    if (!run_synthetic_rope_suite()) all_passed = false;
+    if (!run_synthetic_gemv_swiglu_suite()) all_passed = false;
+    if (!run_synthetic_deltanet_suite()) all_passed = false;
+    if (!run_synthetic_conv1d_suite()) all_passed = false;
+
+    // Conditionally execute golden reference suite if requested
+    if (run_golden) {
+        std::cout << "\n>>> Executing Golden Reference Parity Suite..." << std::endl;
+        if (!run_golden_reference_suite(golden_path, fp16_path, w4a16_path)) {
+            all_passed = false;
+        }
+    }
+
     std::cout << "\n========================================================" << std::endl;
     if (all_passed) {
-        std::cout << ">>> ALL 8 VERIFICATION SUITES PASSED (EXIT CODE 0) <<<" << std::endl;
+        std::cout << ">>> ALL TEST SUITES PASSED (EXIT CODE 0) <<<" << std::endl;
         std::cout << "========================================================" << std::endl;
         return 0;
     } else {
-        std::cerr << ">>> SOME VERIFICATION SUITES FAILED <<<" << std::endl;
+        std::cerr << ">>> SOME TEST SUITES FAILED <<<" << std::endl;
         std::cout << "========================================================" << std::endl;
         return 1;
     }

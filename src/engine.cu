@@ -166,7 +166,8 @@ void QwenEngine::load_model_file(const std::string& qwenbin_path) {
 }
 
 void QwenEngine::setup_arena() {
-    comm_ = create_communicator(0, static_cast<int>(device_ids_.size()), device_ids_, force_wddm_staging_);
+    int my_rank = (device_ids_.size() > 1 && device_ids_[0] == 1) ? 1 : 0;
+    comm_ = create_communicator(my_rank, static_cast<int>(device_ids_.size()), device_ids_, force_wddm_staging_);
 
     int n_layers = model_config_.num_layers();
     layers_.resize(n_layers);
@@ -356,35 +357,41 @@ void QwenEngine::execute_gqa_decode_layer(int l) {
     half* layer_v = d_v_cache_ + (static_cast<size_t>(gqa_idx) * kv_stride);
 
     int h_dim = model_config_.hidden_size();
+    int num_q_heads = model_config_.num_attention_heads();
+    int num_kv_heads = model_config_.num_kv_heads();
+    int head_dim = model_config_.head_dim();
     half* residual_ptr = (device_ids_.size() > 1) ? nullptr : ws_.d_act_0;
     half* output_ptr   = (device_ids_.size() > 1) ? ws_.d_act_1 : ws_.d_act_0;
 
     if (quant_mode_ == QuantMode::FP16) {
-        launch_rmsnorm_fp16(ws_.d_act_0, layers_[l].input_layernorm, ws_.d_act_1, 1, stream_);
+        launch_rmsnorm_fp16(ws_.d_act_0, layers_[l].input_layernorm, ws_.d_act_1, 1, stream_, h_dim);
 
         QKVProjectionView qkv_view = {
             layers_[l].q_weight, nullptr, ws_.d_q,
             layers_[l].k_weight, nullptr, ws_.d_k,
             layers_[l].v_weight, nullptr, ws_.d_v
         };
-        launch_gemv_qkv_fp16(qkv_view, ws_.d_act_1, stream_);
+        launch_gemv_qkv_fp16(qkv_view, ws_.d_act_1, stream_, h_dim, num_q_heads, num_kv_heads, head_dim);
 
         launch_qkv_bias_rope_kv_append(
             ws_.d_q, ws_.d_k, ws_.d_v,
             layers_[l].q_bias, layers_[l].k_bias, layers_[l].v_bias,
-            layer_k, layer_v, d_control_, 1, stream_
+            layer_k, layer_v, d_control_, 1, stream_,
+            num_q_heads, num_kv_heads, head_dim, static_cast<int>(max_seq_len_)
         );
 
         launch_attention_gqa_flash_decode(
             ws_.d_q, layer_k, layer_v,
-            ws_.d_splitk_out, ws_.d_splitk_lse, ws_.d_attn_out, d_control_, stream_
+            ws_.d_splitk_out, ws_.d_splitk_lse, ws_.d_attn_out, d_control_, stream_,
+            num_q_heads, num_kv_heads, head_dim, static_cast<int>(max_seq_len_)
         );
 
         launch_gemv_fp16(reinterpret_cast<const half*>(layers_[l].o_weight), ws_.d_attn_out, residual_ptr, output_ptr, h_dim, h_dim, stream_);
     } else {
         launch_rmsnorm_q8_1(
             ws_.d_act_0, layers_[l].input_layernorm, nullptr,
-            ws_.d_act_q8, ws_.d_act_scale, ws_.d_act_sum8, stream_
+            ws_.d_act_q8, ws_.d_act_scale, ws_.d_act_sum8, stream_,
+            h_dim
         );
 
         QKVProjectionView qkv_view = {
@@ -392,17 +399,19 @@ void QwenEngine::execute_gqa_decode_layer(int l) {
             layers_[l].k_weight, layers_[l].k_scale, ws_.d_k,
             layers_[l].v_weight, layers_[l].v_scale, ws_.d_v
         };
-        launch_gemv_qkv_w4a8(qkv_view, ws_.d_act_q8, ws_.d_act_scale, ws_.d_act_sum8, stream_);
+        launch_gemv_qkv_w4a8(qkv_view, ws_.d_act_q8, ws_.d_act_scale, ws_.d_act_sum8, stream_, h_dim, num_q_heads, num_kv_heads, head_dim);
 
         launch_qkv_bias_rope_kv_append(
             ws_.d_q, ws_.d_k, ws_.d_v,
             layers_[l].q_bias, layers_[l].k_bias, layers_[l].v_bias,
-            layer_k, layer_v, d_control_, 1, stream_
+            layer_k, layer_v, d_control_, 1, stream_,
+            num_q_heads, num_kv_heads, head_dim, static_cast<int>(max_seq_len_)
         );
 
         launch_attention_gqa_flash_decode(
             ws_.d_q, layer_k, layer_v,
             ws_.d_splitk_out, ws_.d_splitk_lse, ws_.d_attn_out, d_control_, stream_,
+            num_q_heads, num_kv_heads, head_dim, static_cast<int>(max_seq_len_),
             ws_.d_act_q8, ws_.d_act_scale, ws_.d_act_sum8
         );
 
@@ -423,7 +432,7 @@ void QwenEngine::execute_deltanet_decode_layer(int l) {
     half* output_ptr   = (device_ids_.size() > 1) ? ws_.d_act_1 : ws_.d_act_0;
 
     // 1. RMSNorm
-    launch_rmsnorm_fp16(ws_.d_act_0, layers_[l].input_layernorm, ws_.d_act_1, 1, stream_);
+    launch_rmsnorm_fp16(ws_.d_act_0, layers_[l].input_layernorm, ws_.d_act_1, 1, stream_, h_dim);
 
     // 2. Depthwise Conv1d Step
     int conv_idx = 0;
@@ -456,11 +465,11 @@ void QwenEngine::execute_decode_pass() {
     // 1. Embedding lookup
     if (quant_mode_ == QuantMode::FP16) {
         launch_embed_lookup_fp16(
-            reinterpret_cast<const half*>(d_embed_weight_), nullptr, ws_.d_act_0, d_control_, 1, stream_
+            reinterpret_cast<const half*>(d_embed_weight_), nullptr, ws_.d_act_0, d_control_, 1, stream_, h_dim
         );
     } else {
         launch_embed_lookup_w4a16(
-            reinterpret_cast<const uint32_t*>(d_embed_weight_), d_embed_scale_, nullptr, ws_.d_act_0, d_control_, 1, stream_
+            reinterpret_cast<const uint32_t*>(d_embed_weight_), d_embed_scale_, nullptr, ws_.d_act_0, d_control_, 1, stream_, h_dim
         );
     }
 
@@ -483,13 +492,14 @@ void QwenEngine::execute_decode_pass() {
         half* mlp_output_ptr   = (device_ids_.size() > 1) ? ws_.d_act_1 : ws_.d_act_0;
 
         if (quant_mode_ == QuantMode::FP16) {
-            launch_rmsnorm_fp16(ws_.d_act_0, layers_[l].post_attention_layernorm, ws_.d_act_1, 1, stream_);
+            launch_rmsnorm_fp16(ws_.d_act_0, layers_[l].post_attention_layernorm, ws_.d_act_1, 1, stream_, h_dim);
             launch_gemv_dual_gate_up_swiglu_fp16(reinterpret_cast<const half*>(layers_[l].gate_up_weight), ws_.d_act_1, ws_.d_mlp_act, h_dim, i_dim, stream_);
             launch_gemv_fp16(reinterpret_cast<const half*>(layers_[l].down_weight), ws_.d_mlp_act, mlp_residual_ptr, mlp_output_ptr, h_dim, i_dim, stream_);
         } else {
             launch_rmsnorm_q8_1(
                 ws_.d_act_0, layers_[l].post_attention_layernorm, nullptr,
-                ws_.d_act_q8, ws_.d_act_scale, ws_.d_act_sum8, stream_
+                ws_.d_act_q8, ws_.d_act_scale, ws_.d_act_sum8, stream_,
+                h_dim
             );
             launch_gemv_dual_gate_up_swiglu_w4a8(
                 reinterpret_cast<const uint32_t*>(layers_[l].gate_up_weight),
@@ -516,12 +526,13 @@ void QwenEngine::execute_decode_pass() {
 
     // 3. Final RMSNorm
     if (quant_mode_ == QuantMode::FP16) {
-        launch_rmsnorm_fp16(ws_.d_act_0, d_final_norm_, ws_.d_act_1, 1, stream_);
+        launch_rmsnorm_fp16(ws_.d_act_0, d_final_norm_, ws_.d_act_1, 1, stream_, h_dim);
         launch_gemv_fp16(reinterpret_cast<const half*>(d_embed_weight_), ws_.d_act_1, nullptr, ws_.d_logits, model_config_.vocab_size(), h_dim, stream_);
     } else {
         launch_rmsnorm_q8_1(
             ws_.d_act_0, d_final_norm_, nullptr,
-            ws_.d_act_q8, ws_.d_act_scale, ws_.d_act_sum8, stream_
+            ws_.d_act_q8, ws_.d_act_scale, ws_.d_act_sum8, stream_,
+            h_dim
         );
         launch_gemv_w4a8(
             reinterpret_cast<const uint32_t*>(d_embed_weight_),
@@ -533,7 +544,8 @@ void QwenEngine::execute_decode_pass() {
 
     // 4. Sample and Advance
     launch_sample_and_advance(
-        ws_.d_logits, ws_.d_sample_val, ws_.d_sample_idx, d_control_, d_mapped_pinned_token_, stream_
+        ws_.d_logits, ws_.d_sample_val, ws_.d_sample_idx, d_control_, d_mapped_pinned_token_, stream_,
+        model_config_.vocab_size()
     );
 }
 
@@ -570,19 +582,22 @@ void QwenEngine::execute_prefill_chunk(int chunk_start, int chunk_len) {
     int h_dim = model_config_.hidden_size();
     int i_dim = model_config_.intermediate_size();
     int n_layers = model_config_.num_layers();
+    int num_q_heads = model_config_.num_attention_heads();
+    int num_kv_heads = model_config_.num_kv_heads();
+    int head_dim = model_config_.head_dim();
 
     if (quant_mode_ == QuantMode::FP16) {
         launch_embed_lookup_fp16(
-            reinterpret_cast<const half*>(d_embed_weight_), ws_.d_prompt_tokens + chunk_start, ws_.d_act_0, nullptr, chunk_len, stream_
+            reinterpret_cast<const half*>(d_embed_weight_), ws_.d_prompt_tokens + chunk_start, ws_.d_act_0, nullptr, chunk_len, stream_, h_dim
         );
     } else {
         launch_embed_lookup_w4a16(
-            reinterpret_cast<const uint32_t*>(d_embed_weight_), d_embed_scale_, ws_.d_prompt_tokens + chunk_start, ws_.d_act_0, nullptr, chunk_len, stream_
+            reinterpret_cast<const uint32_t*>(d_embed_weight_), d_embed_scale_, ws_.d_prompt_tokens + chunk_start, ws_.d_act_0, nullptr, chunk_len, stream_, h_dim
         );
     }
 
     for (int l = 0; l < n_layers; ++l) {
-        launch_rmsnorm_fp16(ws_.d_act_0, layers_[l].input_layernorm, ws_.d_act_1, chunk_len, stream_);
+        launch_rmsnorm_fp16(ws_.d_act_0, layers_[l].input_layernorm, ws_.d_act_1, chunk_len, stream_, h_dim);
 
         if (model_config_.layer(l).type == LAYER_GQA) {
             int gqa_idx = gqa_layer_idx_[l];
@@ -596,16 +611,18 @@ void QwenEngine::execute_prefill_chunk(int chunk_start, int chunk_len) {
                     layers_[l].k_weight, nullptr, ws_.d_k,
                     layers_[l].v_weight, nullptr, ws_.d_v
                 };
-                launch_gemm_prefill_qkv_fp16(qkv_view, ws_.d_act_1, chunk_len, stream_);
+                launch_gemm_prefill_qkv_fp16(qkv_view, ws_.d_act_1, chunk_len, stream_, h_dim, num_q_heads, num_kv_heads, head_dim);
 
                 launch_qkv_bias_rope_kv_append(
                     ws_.d_q, ws_.d_k, ws_.d_v,
                     layers_[l].q_bias, layers_[l].k_bias, layers_[l].v_bias,
-                    layer_k, layer_v, d_control_, chunk_len, stream_
+                    layer_k, layer_v, d_control_, chunk_len, stream_,
+                    num_q_heads, num_kv_heads, head_dim, static_cast<int>(max_seq_len_)
                 );
 
                 launch_attention_gqa_prefill(
-                    ws_.d_q, layer_k, layer_v, ws_.d_attn_out, d_control_, chunk_len, stream_
+                    ws_.d_q, layer_k, layer_v, ws_.d_attn_out, d_control_, chunk_len, stream_,
+                    num_q_heads, num_kv_heads, head_dim, static_cast<int>(max_seq_len_), h_dim
                 );
 
                 launch_gemm_prefill_fp16(reinterpret_cast<const half*>(layers_[l].o_weight), ws_.d_attn_out, ws_.d_act_0, ws_.d_act_0, chunk_len, h_dim, h_dim, stream_);
@@ -615,16 +632,18 @@ void QwenEngine::execute_prefill_chunk(int chunk_start, int chunk_len) {
                     layers_[l].k_weight, layers_[l].k_scale, ws_.d_k,
                     layers_[l].v_weight, layers_[l].v_scale, ws_.d_v
                 };
-                launch_gemm_prefill_qkv_w4a16(qkv_view, ws_.d_act_1, chunk_len, stream_);
+                launch_gemm_prefill_qkv_w4a16(qkv_view, ws_.d_act_1, chunk_len, stream_, h_dim, num_q_heads, num_kv_heads, head_dim);
 
                 launch_qkv_bias_rope_kv_append(
                     ws_.d_q, ws_.d_k, ws_.d_v,
                     layers_[l].q_bias, layers_[l].k_bias, layers_[l].v_bias,
-                    layer_k, layer_v, d_control_, chunk_len, stream_
+                    layer_k, layer_v, d_control_, chunk_len, stream_,
+                    num_q_heads, num_kv_heads, head_dim, static_cast<int>(max_seq_len_)
                 );
 
                 launch_attention_gqa_prefill(
-                    ws_.d_q, layer_k, layer_v, ws_.d_attn_out, d_control_, chunk_len, stream_
+                    ws_.d_q, layer_k, layer_v, ws_.d_attn_out, d_control_, chunk_len, stream_,
+                    num_q_heads, num_kv_heads, head_dim, static_cast<int>(max_seq_len_), h_dim
                 );
 
                 launch_gemm_prefill_w4a16(reinterpret_cast<const uint32_t*>(layers_[l].o_weight), layers_[l].o_scale, ws_.d_attn_out, ws_.d_act_0, ws_.d_act_0, chunk_len, h_dim, h_dim, stream_);
@@ -641,21 +660,21 @@ void QwenEngine::execute_prefill_chunk(int chunk_start, int chunk_len) {
 
             for (int t = 0; t < chunk_len; ++t) {
                 const half* tok_act = ws_.d_act_1 + static_cast<size_t>(t) * h_dim;
-                half* tok_attn_out = ws_.d_attn_out + static_cast<size_t>(t) * h_dim;
+                half* tok_res = ws_.d_act_0 + static_cast<size_t>(t) * h_dim;
 
                 launch_depthwise_conv1d_step(tok_act, layers_[l].conv1d_weight, layers_[l].conv1d_bias, layer_conv_state, ws_.d_q, q_dim, 4, stream_);
                 launch_deltanet_decode_sm75(ws_.d_q, ws_.d_q, ws_.d_q, layers_[l].decay_weight, layer_s_state, ws_.d_attn_out, 1, model_config_.num_attention_heads(), model_config_.head_dim(), stream_);
-                launch_gemv_fp16(reinterpret_cast<const half*>(layers_[l].delta_out_weight), ws_.d_attn_out, tok_act, tok_attn_out, h_dim, q_dim, stream_);
+                launch_gemv_fp16(reinterpret_cast<const half*>(layers_[l].delta_out_weight), ws_.d_attn_out, tok_res, tok_res, h_dim, q_dim, stream_);
             }
         }
 
-        launch_rmsnorm_fp16(ws_.d_act_0, layers_[l].post_attention_layernorm, ws_.d_act_1, chunk_len, stream_);
+        launch_rmsnorm_fp16(ws_.d_act_0, layers_[l].post_attention_layernorm, ws_.d_act_1, chunk_len, stream_, h_dim);
 
         if (quant_mode_ == QuantMode::FP16) {
-            launch_gemm_prefill_dual_gate_up_swiglu_fp16(reinterpret_cast<const half*>(layers_[l].gate_up_weight), ws_.d_act_1, ws_.d_mlp_act, chunk_len, stream_);
+            launch_gemm_prefill_dual_gate_up_swiglu_fp16(reinterpret_cast<const half*>(layers_[l].gate_up_weight), ws_.d_act_1, ws_.d_mlp_act, chunk_len, stream_, h_dim, i_dim);
             launch_gemm_prefill_fp16(reinterpret_cast<const half*>(layers_[l].down_weight), ws_.d_mlp_act, ws_.d_act_0, ws_.d_act_0, chunk_len, h_dim, i_dim, stream_);
         } else {
-            launch_gemm_prefill_dual_gate_up_swiglu_w4a16(reinterpret_cast<const uint32_t*>(layers_[l].gate_up_weight), layers_[l].gate_up_scale, ws_.d_act_1, ws_.d_mlp_act, chunk_len, stream_);
+            launch_gemm_prefill_dual_gate_up_swiglu_w4a16(reinterpret_cast<const uint32_t*>(layers_[l].gate_up_weight), layers_[l].gate_up_scale, ws_.d_act_1, ws_.d_mlp_act, chunk_len, stream_, h_dim, i_dim);
             launch_gemm_prefill_w4a16(reinterpret_cast<const uint32_t*>(layers_[l].down_weight), layers_[l].down_scale, ws_.d_mlp_act, ws_.d_act_0, ws_.d_act_0, chunk_len, h_dim, i_dim, stream_);
         }
     }
@@ -699,12 +718,13 @@ int32_t QwenEngine::prefill(const std::vector<int32_t>& prompt_tokens, float tem
     half* d_last_hidden = ws_.d_act_0 + static_cast<size_t>((total_tokens - 1) % PREFILL_MAX_CHUNK) * h_dim;
 
     if (quant_mode_ == QuantMode::FP16) {
-        launch_rmsnorm_fp16(d_last_hidden, d_final_norm_, ws_.d_act_1, 1, stream_);
+        launch_rmsnorm_fp16(d_last_hidden, d_final_norm_, ws_.d_act_1, 1, stream_, h_dim);
         launch_gemv_fp16(reinterpret_cast<const half*>(d_embed_weight_), ws_.d_act_1, nullptr, ws_.d_logits, model_config_.vocab_size(), h_dim, stream_);
     } else {
         launch_rmsnorm_q8_1(
             d_last_hidden, d_final_norm_, nullptr,
-            ws_.d_act_q8, ws_.d_act_scale, ws_.d_act_sum8, stream_
+            ws_.d_act_q8, ws_.d_act_scale, ws_.d_act_sum8, stream_,
+            h_dim
         );
         launch_gemv_w4a8(
             reinterpret_cast<const uint32_t*>(d_embed_weight_),
@@ -715,7 +735,8 @@ int32_t QwenEngine::prefill(const std::vector<int32_t>& prompt_tokens, float tem
     }
 
     launch_sample_and_advance(
-        ws_.d_logits, ws_.d_sample_val, ws_.d_sample_idx, d_control_, d_mapped_pinned_token_, stream_
+        ws_.d_logits, ws_.d_sample_val, ws_.d_sample_idx, d_control_, d_mapped_pinned_token_, stream_,
+        model_config_.vocab_size()
     );
 
     CUDA_CHECK(cudaStreamSynchronize(stream_));

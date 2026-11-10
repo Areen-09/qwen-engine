@@ -14,7 +14,8 @@ void launch_embed_lookup_fp16(
     half* out_hidden,
     const DeviceControlBlock* d_control,
     int num_tokens,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int hidden_size = HIDDEN_SIZE
 );
 
 void launch_embed_lookup_w4a16(
@@ -24,7 +25,8 @@ void launch_embed_lookup_w4a16(
     half* out_hidden,
     const DeviceControlBlock* d_control,
     int num_tokens,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int hidden_size = HIDDEN_SIZE
 );
 
 // QKV Projection View descriptor for single-launch fused QKV projections
@@ -40,7 +42,8 @@ void launch_rmsnorm_fp16(
     const half* gamma,
     half* output,
     int num_tokens,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int hidden_size = HIDDEN_SIZE
 );
 
 void launch_rmsnorm_q8_1(
@@ -50,7 +53,8 @@ void launch_rmsnorm_q8_1(
     int8_t* out_q8,
     float* out_scale,
     int32_t* out_sum8,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int hidden_size = HIDDEN_SIZE
 );
 
 void launch_quantize_fp16_to_q8_1(
@@ -76,7 +80,11 @@ void launch_gemv_fp16(
 void launch_gemv_qkv_fp16(
     const QKVProjectionView& view,
     const half* input_x,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int in_features = HIDDEN_SIZE,
+    int num_q_heads = NUM_Q_HEADS,
+    int num_kv_heads = NUM_KV_HEADS,
+    int head_dim = HEAD_DIM
 );
 
 void launch_gemv_dual_gate_up_swiglu_fp16(
@@ -118,7 +126,11 @@ void launch_gemv_qkv_w4a8(
     const int8_t* input_q8,
     const float* input_scale,
     const int32_t* input_sum8,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int in_features = HIDDEN_SIZE,
+    int num_q_heads = NUM_Q_HEADS,
+    int num_kv_heads = NUM_KV_HEADS,
+    int head_dim = HEAD_DIM
 );
 
 void launch_gemv_dual_gate_up_swiglu_w4a16(
@@ -159,7 +171,11 @@ void launch_gemm_prefill_qkv_fp16(
     const QKVProjectionView& view,
     const half* input_x,
     int M,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int in_features = HIDDEN_SIZE,
+    int num_q_heads = NUM_Q_HEADS,
+    int num_kv_heads = NUM_KV_HEADS,
+    int head_dim = HEAD_DIM
 );
 
 void launch_gemm_prefill_dual_gate_up_swiglu_fp16(
@@ -167,7 +183,9 @@ void launch_gemm_prefill_dual_gate_up_swiglu_fp16(
     const half* input_x,
     half* output_mlp,
     int M,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int hidden_size = HIDDEN_SIZE,
+    int intermediate_size = INTERMEDIATE_SIZE
 );
 
 void launch_gemm_prefill_w4a16(
@@ -186,7 +204,11 @@ void launch_gemm_prefill_qkv_w4a16(
     const QKVProjectionView& view,
     const half* input_x,
     int M,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int in_features = HIDDEN_SIZE,
+    int num_q_heads = NUM_Q_HEADS,
+    int num_kv_heads = NUM_KV_HEADS,
+    int head_dim = HEAD_DIM
 );
 
 void launch_gemm_prefill_dual_gate_up_swiglu_w4a16(
@@ -195,7 +217,9 @@ void launch_gemm_prefill_dual_gate_up_swiglu_w4a16(
     const half* input_x,
     half* output_mlp,
     int M,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int hidden_size = HIDDEN_SIZE,
+    int intermediate_size = INTERMEDIATE_SIZE
 );
 
 // 6. QKV Bias + NeoX Split-Half RoPE + KV Cache write
@@ -210,7 +234,11 @@ void launch_qkv_bias_rope_kv_append(
     half* layer_v_cache,
     const DeviceControlBlock* d_control,
     int num_tokens,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int num_q_heads = NUM_Q_HEADS,
+    int num_kv_heads = NUM_KV_HEADS,
+    int head_dim = HEAD_DIM,
+    int max_seq_len = MAX_SEQ_LEN
 );
 
 // 7. GQA FlashDecoding & Causal Prefill Attention
@@ -223,6 +251,10 @@ void launch_attention_gqa_flash_decode(
     half* attn_out,
     const DeviceControlBlock* d_control,
     cudaStream_t stream,
+    int num_q_heads = NUM_Q_HEADS,
+    int num_kv_heads = NUM_KV_HEADS,
+    int head_dim = HEAD_DIM,
+    int max_seq_len = MAX_SEQ_LEN,
     int8_t* out_q8 = nullptr,
     float* out_scale = nullptr,
     int32_t* out_sum8 = nullptr
@@ -235,7 +267,12 @@ void launch_attention_gqa_prefill(
     half* attn_out,
     const DeviceControlBlock* d_control,
     int num_tokens,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int num_q_heads = NUM_Q_HEADS,
+    int num_kv_heads = NUM_KV_HEADS,
+    int head_dim = HEAD_DIM,
+    int max_seq_len = MAX_SEQ_LEN,
+    int hidden_size = HIDDEN_SIZE
 );
 
 // 8. Device Argmax / Gumbel-Max Sampling & Sequence Advance
@@ -245,7 +282,8 @@ void launch_sample_and_advance(
     int32_t* sample_scratch_idx,
     DeviceControlBlock* d_control,
     int32_t* d_mapped_pinned_token,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int vocab_size = VOCAB_SIZE
 );
 
 } // namespace qwen

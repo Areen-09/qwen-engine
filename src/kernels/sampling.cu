@@ -61,7 +61,8 @@ __global__ void sample_stage1_kernel(
     const half* __restrict__ logits,
     float* __restrict__ sample_scratch_val,
     int32_t* __restrict__ sample_scratch_idx,
-    const DeviceControlBlock* __restrict__ d_control
+    const DeviceControlBlock* __restrict__ d_control,
+    int vocab_size
 ) {
     float temp = 0.0f;
     uint64_t seed = 0;
@@ -79,7 +80,7 @@ __global__ void sample_stage1_kernel(
     int global_tid = blockIdx.x * blockDim.x + tid;
     int total_threads = gridDim.x * blockDim.x;
 
-    for (int i = global_tid; i < VOCAB_SIZE; i += total_threads) {
+    for (int i = global_tid; i < vocab_size; i += total_threads) {
         float val = __half2float(logits[i]);
 
         if (temp > 1e-5f) {
@@ -214,13 +215,14 @@ void launch_sample_and_advance(
     int32_t* sample_scratch_idx,
     DeviceControlBlock* d_control,
     int32_t* d_mapped_pinned_token,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int vocab_size
 ) {
     constexpr int GRID_SIZE = 256;
     constexpr int BLOCK_SIZE = 256;
 
     sample_stage1_kernel<<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(
-        logits, sample_scratch_val, sample_scratch_idx, d_control
+        logits, sample_scratch_val, sample_scratch_idx, d_control, vocab_size
     );
 
     sample_stage2_and_advance_kernel<<<1, BLOCK_SIZE, 0, stream>>>(

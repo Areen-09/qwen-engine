@@ -40,6 +40,8 @@ def test_qwen25_dynamic_engine_parity():
     native_eng.rollback_to(len(prompt))
     assert native_eng.current_seq_pos() == len(prompt)
 
+    del native_eng
+
 def test_qwen35_hybrid_deltanet_execution():
     with tempfile.TemporaryDirectory() as tmpdir:
         gguf_path = os.path.join(tmpdir, "hybrid_model.gguf")
@@ -56,26 +58,64 @@ def test_qwen35_hybrid_deltanet_execution():
         stats = native_eng.get_memory_stats()
         # For 1 GQA layer: 1 layer * 2 kv_heads * 512 max_seq * 128 head_dim * 2 (half) * 2 (K and V) = 524,288 bytes = 0.5 MB
         # An equivalent 4-layer pure GQA model would allocate 4 * 0.5 MB = 2 MB (2,097,152 bytes).
-        # Thus KV cache is exactly 25% of a 4-layer pure attention model!
+        # Thus KV cache is exactly 25% of a 4-layer pure attention model (75% reduction)!
         assert stats.kv_cache_bytes == 524288
 
         # Execute prefill
         prompt = [5, 10, 15, 20]
         tok1 = native_eng.prefill(prompt, 0.0)
+        assert tok1 >= 0
 
         # Autoregressive decode steps
         tok2 = native_eng.decode_step()
         tok3 = native_eng.decode_step()
+        assert tok2 >= 0
+        assert tok3 >= 0
 
         assert native_eng.current_seq_pos() == len(prompt) + 2
 
-        # Test rollback on hybrid DeltaNet model
-        native_eng.rollback_to(len(prompt))
-        assert native_eng.current_seq_pos() == len(prompt)
-
-        # Generating again after rollback is deterministic
-        tok_replay_2 = native_eng.decode_step()
-        assert tok_replay_2 == tok2
-
         # Explicitly release engine before tempdir cleanup on Windows
         del native_eng
+
+def test_hybrid_rollback_determinism():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        gguf_path = os.path.join(tmpdir, "hybrid_model_rollback.gguf")
+        qwenbin_path = os.path.join(tmpdir, "hybrid_model_rollback.qwenbin")
+
+        create_synthetic_gguf(gguf_path, num_layers=4, hidden_size=256, intermediate_size=512)
+        convert_gguf_to_qwenbin(gguf_path, qwenbin_path, mode="fp16")
+
+        native_eng = _core.NativeEngine(qwenbin_path, 0)
+        try:
+            assert native_eng.num_gqa_layers() == 1
+            assert native_eng.num_deltanet_layers() == 3
+
+            prompt = [1, 10, 100, 1000]
+            first_tok = native_eng.prefill(prompt, 0.0)
+            assert first_tok >= 0
+
+            # Execute 6 consecutive decode steps with greedy sampling (temperature = 0.0)
+            generated_tokens = []
+            for _ in range(6):
+                tok = native_eng.decode_step()
+                generated_tokens.append(tok)
+
+            assert len(generated_tokens) == 6
+            current_pos = native_eng.current_seq_pos()
+            assert current_pos == len(prompt) + 6
+
+            # Call engine.rollback_to(current_pos - 3)
+            target_pos = current_pos - 3
+            native_eng.rollback_to(target_pos)
+            assert native_eng.current_seq_pos() == target_pos
+
+            # Execute 3 decode steps and assert generated tokens are bitwise-identical to steps 4, 5, 6
+            replayed_tokens = []
+            for _ in range(3):
+                replayed_tokens.append(native_eng.decode_step())
+
+            assert replayed_tokens == generated_tokens[3:], (
+                f"Replayed tokens {replayed_tokens} must match original decode steps {generated_tokens[3:]}"
+            )
+        finally:
+            del native_eng

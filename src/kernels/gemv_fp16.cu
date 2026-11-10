@@ -77,11 +77,15 @@ __global__ void gemv_fp16_kernel(
 
 __global__ void gemv_qkv_fp16_kernel(
     QKVProjectionView view,
-    const half* __restrict__ input_x
+    const half* __restrict__ input_x,
+    int in_features,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim
 ) {
     extern __shared__ half s_x[];
 
-    for (int i = threadIdx.x; i < HIDDEN_SIZE; i += blockDim.x) {
+    for (int i = threadIdx.x; i < in_features; i += blockDim.x) {
         s_x[i] = input_x[i];
     }
     __syncthreads();
@@ -91,34 +95,36 @@ __global__ void gemv_qkv_fp16_kernel(
     int warps_per_block = blockDim.x / 32;
     int row = blockIdx.x * warps_per_block + warp_id;
 
-    constexpr int TOTAL_ROWS = Q_DIM + 2 * KV_DIM; // 2048
-    if (row >= TOTAL_ROWS) return;
+    int q_dim = num_q_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+    int total_rows = q_dim + 2 * kv_dim;
+    if (row >= total_rows) return;
 
     const half* weight = nullptr;
     half* output = nullptr;
     int r = 0;
 
-    if (row < Q_DIM) { // 0 .. 1535
+    if (row < q_dim) {
         weight = reinterpret_cast<const half*>(view.q_weight);
         output = view.d_q;
         r = row;
-    } else if (row < Q_DIM + KV_DIM) { // 1536 .. 1791
+    } else if (row < q_dim + kv_dim) {
         weight = reinterpret_cast<const half*>(view.k_weight);
         output = view.d_k;
-        r = row - Q_DIM;
-    } else { // 1792 .. 2047
+        r = row - q_dim;
+    } else {
         weight = reinterpret_cast<const half*>(view.v_weight);
         output = view.d_v;
-        r = row - (Q_DIM + KV_DIM);
+        r = row - (q_dim + kv_dim);
     }
 
-    const half* w_row = weight + static_cast<size_t>(r) * HIDDEN_SIZE;
+    const half* w_row = weight + static_cast<size_t>(r) * in_features;
     const uint4* w_u4 = reinterpret_cast<const uint4*>(w_row);
     const uint4* x_u4 = reinterpret_cast<const uint4*>(s_x);
-    constexpr int NUM_U4 = HIDDEN_SIZE / 8; // 192
+    int num_u4 = in_features / 8;
 
     float acc = 0.0f;
-    for (int i = lane_id; i < NUM_U4; i += 32) {
+    for (int i = lane_id; i < num_u4; i += 32) {
         uint4 w_val = w_u4[i];
         uint4 x_val = x_u4[i];
 
@@ -235,16 +241,22 @@ void launch_gemv_fp16(
 void launch_gemv_qkv_fp16(
     const QKVProjectionView& view,
     const half* input_x,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int in_features,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim
 ) {
     constexpr int BLOCK_THREADS = 128;
-    constexpr int TOTAL_ROWS = Q_DIM + 2 * KV_DIM; // 2048
+    int q_dim = num_q_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+    int total_rows = q_dim + 2 * kv_dim;
     constexpr int WARPS_PER_BLOCK = BLOCK_THREADS / 32;
-    constexpr int GRID = TOTAL_ROWS / WARPS_PER_BLOCK; // 512
-    size_t smem_bytes = static_cast<size_t>(HIDDEN_SIZE) * sizeof(half);
+    int grid = (total_rows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    size_t smem_bytes = static_cast<size_t>(in_features) * sizeof(half);
 
-    gemv_qkv_fp16_kernel<<<GRID, BLOCK_THREADS, smem_bytes, stream>>>(
-        view, input_x
+    gemv_qkv_fp16_kernel<<<grid, BLOCK_THREADS, smem_bytes, stream>>>(
+        view, input_x, in_features, num_q_heads, num_kv_heads, head_dim
     );
     CUDA_KERNEL_CHECK();
 }

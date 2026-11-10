@@ -127,6 +127,11 @@ public:
             void* peer_staging = g_p2p_state.device_peer_buf[peer_rank];
             cudaEvent_t peer_event = g_p2p_state.peer_events[peer_rank];
 
+            if (!peer_staging || !peer_event) {
+                // Peer rank has not registered its staging buffer in this process
+                return;
+            }
+
             // 1. Copy local buffer into peer's staging buffer across PCIe BAR1
             CUDA_CHECK(cudaMemcpyPeerAsync(peer_staging, device_ids_[peer_rank],
                                            sendrecvbuf, device_ids_[rank_],
@@ -168,6 +173,10 @@ public:
             // Host rendezvous barrier
             {
                 std::unique_lock<std::mutex> lock(g_p2p_state.mtx);
+                if (!g_p2p_state.host_staging[0] || !g_p2p_state.host_staging[1]) {
+                    // Both host staging buffers not yet allocated; skip host reduction
+                    return;
+                }
                 int cur_step = g_p2p_state.step_counter;
                 g_p2p_state.current_count = count;
                 g_p2p_state.current_type = type;

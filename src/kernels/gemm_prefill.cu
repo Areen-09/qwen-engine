@@ -281,10 +281,15 @@ __global__ void gemm_prefill_w4a16_kernel(
 __global__ void gemm_prefill_qkv_fp16_kernel(
     QKVProjectionView view,
     const half* __restrict__ input_x,
-    int M
+    int M,
+    int in_features,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim
 ) {
-    constexpr int K = HIDDEN_SIZE; // 1536
-    constexpr int TOTAL_N = Q_DIM + 2 * KV_DIM; // 2048
+    int K = in_features;
+    int q_dim = num_q_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
 
     __shared__ PrefillSmem smem;
 
@@ -313,21 +318,21 @@ __global__ void gemm_prefill_qkv_fp16_kernel(
     int col_offset = 0;
     int out_stride = 0;
 
-    if (n_block < Q_DIM) { // 0 .. 1535
+    if (n_block < q_dim) {
         weight = reinterpret_cast<const half*>(view.q_weight);
         output = view.d_q;
         col_offset = 0;
-        out_stride = Q_DIM;
-    } else if (n_block < Q_DIM + KV_DIM) { // 1536 .. 1791
+        out_stride = q_dim;
+    } else if (n_block < q_dim + kv_dim) {
         weight = reinterpret_cast<const half*>(view.k_weight);
         output = view.d_k;
-        col_offset = Q_DIM;
-        out_stride = KV_DIM;
-    } else { // 1792 .. 2047
+        col_offset = q_dim;
+        out_stride = kv_dim;
+    } else {
         weight = reinterpret_cast<const half*>(view.v_weight);
         output = view.d_v;
-        col_offset = Q_DIM + KV_DIM;
-        out_stride = KV_DIM;
+        col_offset = q_dim + kv_dim;
+        out_stride = kv_dim;
     }
 
     int num_kt = K / PREFILL_WMMA_BK;
@@ -408,11 +413,16 @@ __global__ void gemm_prefill_qkv_fp16_kernel(
 __global__ void gemm_prefill_qkv_w4a16_kernel(
     QKVProjectionView view,
     const half* __restrict__ input_x,
-    int M
+    int M,
+    int in_features,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim
 ) {
-    constexpr int K = HIDDEN_SIZE; // 1536
-    constexpr int TOTAL_N = Q_DIM + 2 * KV_DIM; // 2048
-    constexpr int NUM_GROUPS = K / QUANT_GROUP_SIZE; // 12
+    int K = in_features;
+    int q_dim = num_q_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+    int num_groups = K / QUANT_GROUP_SIZE;
 
     __shared__ PrefillSmem smem;
 
@@ -441,24 +451,24 @@ __global__ void gemm_prefill_qkv_w4a16_kernel(
     int col_offset = 0;
     int out_stride = 0;
 
-    if (n_block < Q_DIM) {
+    if (n_block < q_dim) {
         qweight = reinterpret_cast<const uint32_t*>(view.q_weight);
         scales  = view.q_scale;
         output  = view.d_q;
         col_offset = 0;
-        out_stride = Q_DIM;
-    } else if (n_block < Q_DIM + KV_DIM) {
+        out_stride = q_dim;
+    } else if (n_block < q_dim + kv_dim) {
         qweight = reinterpret_cast<const uint32_t*>(view.k_weight);
         scales  = view.k_scale;
         output  = view.d_k;
-        col_offset = Q_DIM;
-        out_stride = KV_DIM;
+        col_offset = q_dim;
+        out_stride = kv_dim;
     } else {
         qweight = reinterpret_cast<const uint32_t*>(view.v_weight);
         scales  = view.v_scale;
         output  = view.d_v;
-        col_offset = Q_DIM + KV_DIM;
-        out_stride = KV_DIM;
+        col_offset = q_dim + kv_dim;
+        out_stride = kv_dim;
     }
 
     int num_kt = K / PREFILL_WMMA_BK;
@@ -489,8 +499,8 @@ __global__ void gemm_prefill_qkv_w4a16_kernel(
         int group_idx0 = (k_offset + b_col) / QUANT_GROUP_SIZE;
         int group_idx1 = (k_offset + b_col + 8) / QUANT_GROUP_SIZE;
 
-        half sc0 = scales[static_cast<size_t>(r) * NUM_GROUPS + group_idx0];
-        half sc1 = scales[static_cast<size_t>(r) * NUM_GROUPS + group_idx1];
+        half sc0 = scales[static_cast<size_t>(r) * num_groups + group_idx0];
+        half sc1 = scales[static_cast<size_t>(r) * num_groups + group_idx1];
 
         uint32_t p0 = qweight[static_cast<size_t>(r) * (K / 8) + word_idx0];
         uint32_t p1 = qweight[static_cast<size_t>(r) * (K / 8) + word_idx1];
@@ -553,10 +563,12 @@ __global__ void gemm_prefill_dual_gate_up_swiglu_fp16_kernel(
     const half* __restrict__ gate_up_weight,
     const half* __restrict__ input_x,
     half* __restrict__ output_mlp,
-    int M
+    int M,
+    int hidden_size,
+    int intermediate_size
 ) {
-    constexpr int K = HIDDEN_SIZE; // 1536
-    constexpr int TOTAL_N = 2 * INTERMEDIATE_SIZE; // 17,920
+    int K = hidden_size;
+    int total_n = 2 * intermediate_size;
 
     __shared__ PrefillSmem smem;
 
@@ -602,7 +614,7 @@ __global__ void gemm_prefill_dual_gate_up_swiglu_fp16_kernel(
         int b_col = (tid % 2) * 16;
         int global_n = n_block + b_row;
 
-        if (global_n < TOTAL_N) {
+        if (global_n < total_n) {
             const uint4* w_u4_0 = reinterpret_cast<const uint4*>(gate_up_weight + static_cast<size_t>(global_n) * K + k_offset + b_col);
             const uint4* w_u4_1 = reinterpret_cast<const uint4*>(gate_up_weight + static_cast<size_t>(global_n) * K + k_offset + b_col + 8);
             *reinterpret_cast<uint4*>(&smem.mainloop.s_B[b_row][b_col])     = *w_u4_0;
@@ -648,11 +660,11 @@ __global__ void gemm_prefill_dual_gate_up_swiglu_fp16_kernel(
                 int global_row = m_block + warp_m * 32 + mi * 16 + r;
                 int feat_idx = (n_sub_base / 2) + p;
 
-                if (global_row < M && feat_idx < INTERMEDIATE_SIZE) {
+                if (global_row < M && feat_idx < intermediate_size) {
                     float gate = smem.s_C[warp_id][r][2 * p + 0];
                     float up   = smem.s_C[warp_id][r][2 * p + 1];
                     float silu = gate / (1.0f + expf(-gate));
-                    output_mlp[static_cast<size_t>(global_row) * INTERMEDIATE_SIZE + feat_idx] = __float2half(silu * up);
+                    output_mlp[static_cast<size_t>(global_row) * intermediate_size + feat_idx] = __float2half(silu * up);
                 }
             }
             __syncwarp();
@@ -669,11 +681,13 @@ __global__ void gemm_prefill_dual_gate_up_swiglu_w4a16_kernel(
     const half* __restrict__ gate_up_scales,
     const half* __restrict__ input_x,
     half* __restrict__ output_mlp,
-    int M
+    int M,
+    int hidden_size,
+    int intermediate_size
 ) {
-    constexpr int K = HIDDEN_SIZE; // 1536
-    constexpr int TOTAL_N = 2 * INTERMEDIATE_SIZE; // 17,920
-    constexpr int NUM_GROUPS = K / QUANT_GROUP_SIZE; // 12
+    int K = hidden_size;
+    int total_n = 2 * intermediate_size;
+    int num_groups = K / QUANT_GROUP_SIZE;
 
     __shared__ PrefillSmem smem;
 
@@ -719,14 +733,14 @@ __global__ void gemm_prefill_dual_gate_up_swiglu_w4a16_kernel(
         int b_col = (tid % 2) * 16;
         int global_n = n_block + b_row;
 
-        if (global_n < TOTAL_N) {
+        if (global_n < total_n) {
             int word_idx0 = kt * 4 + (b_col / 8);
             int word_idx1 = kt * 4 + ((b_col + 8) / 8);
             int group_idx0 = (k_offset + b_col) / QUANT_GROUP_SIZE;
             int group_idx1 = (k_offset + b_col + 8) / QUANT_GROUP_SIZE;
 
-            half sc0 = gate_up_scales[static_cast<size_t>(global_n) * NUM_GROUPS + group_idx0];
-            half sc1 = gate_up_scales[static_cast<size_t>(global_n) * NUM_GROUPS + group_idx1];
+            half sc0 = gate_up_scales[static_cast<size_t>(global_n) * num_groups + group_idx0];
+            half sc1 = gate_up_scales[static_cast<size_t>(global_n) * num_groups + group_idx1];
 
             uint32_t p0 = gate_up_qweight[static_cast<size_t>(global_n) * (K / 8) + word_idx0];
             uint32_t p1 = gate_up_qweight[static_cast<size_t>(global_n) * (K / 8) + word_idx1];
@@ -777,11 +791,11 @@ __global__ void gemm_prefill_dual_gate_up_swiglu_w4a16_kernel(
                 int global_row = m_block + warp_m * 32 + mi * 16 + r;
                 int feat_idx = (n_sub_base / 2) + p;
 
-                if (global_row < M && feat_idx < INTERMEDIATE_SIZE) {
+                if (global_row < M && feat_idx < intermediate_size) {
                     float gate = smem.s_C[warp_id][r][2 * p + 0];
                     float up   = smem.s_C[warp_id][r][2 * p + 1];
                     float silu = gate / (1.0f + expf(-gate));
-                    output_mlp[static_cast<size_t>(global_row) * INTERMEDIATE_SIZE + feat_idx] = __float2half(silu * up);
+                    output_mlp[static_cast<size_t>(global_row) * intermediate_size + feat_idx] = __float2half(silu * up);
                 }
             }
             __syncwarp();
@@ -814,12 +828,16 @@ void launch_gemm_prefill_qkv_fp16(
     const QKVProjectionView& view,
     const half* input_x,
     int M,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int in_features,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim
 ) {
-    constexpr int TOTAL_N = Q_DIM + 2 * KV_DIM; // 2048
-    dim3 grid((TOTAL_N + PREFILL_WMMA_BN - 1) / PREFILL_WMMA_BN, (M + PREFILL_WMMA_BM - 1) / PREFILL_WMMA_BM);
+    int total_n = (num_q_heads + 2 * num_kv_heads) * head_dim;
+    dim3 grid((total_n + PREFILL_WMMA_BN - 1) / PREFILL_WMMA_BN, (M + PREFILL_WMMA_BM - 1) / PREFILL_WMMA_BM);
     gemm_prefill_qkv_fp16_kernel<<<grid, 128, 0, stream>>>(
-        view, input_x, M
+        view, input_x, M, in_features, num_q_heads, num_kv_heads, head_dim
     );
     CUDA_KERNEL_CHECK();
 }
@@ -829,12 +847,14 @@ void launch_gemm_prefill_dual_gate_up_swiglu_fp16(
     const half* input_x,
     half* output_mlp,
     int M,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int hidden_size,
+    int intermediate_size
 ) {
-    constexpr int TOTAL_N = 2 * INTERMEDIATE_SIZE; // 17,920
-    dim3 grid((TOTAL_N + PREFILL_WMMA_BN - 1) / PREFILL_WMMA_BN, (M + PREFILL_WMMA_BM - 1) / PREFILL_WMMA_BM);
+    int total_n = 2 * intermediate_size;
+    dim3 grid((total_n + PREFILL_WMMA_BN - 1) / PREFILL_WMMA_BN, (M + PREFILL_WMMA_BM - 1) / PREFILL_WMMA_BM);
     gemm_prefill_dual_gate_up_swiglu_fp16_kernel<<<grid, 128, 0, stream>>>(
-        gate_up_weight, input_x, output_mlp, M
+        gate_up_weight, input_x, output_mlp, M, hidden_size, intermediate_size
     );
     CUDA_KERNEL_CHECK();
 }
@@ -861,12 +881,16 @@ void launch_gemm_prefill_qkv_w4a16(
     const QKVProjectionView& view,
     const half* input_x,
     int M,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int in_features,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim
 ) {
-    constexpr int TOTAL_N = Q_DIM + 2 * KV_DIM; // 2048
-    dim3 grid((TOTAL_N + PREFILL_WMMA_BN - 1) / PREFILL_WMMA_BN, (M + PREFILL_WMMA_BM - 1) / PREFILL_WMMA_BM);
+    int total_n = (num_q_heads + 2 * num_kv_heads) * head_dim;
+    dim3 grid((total_n + PREFILL_WMMA_BN - 1) / PREFILL_WMMA_BN, (M + PREFILL_WMMA_BM - 1) / PREFILL_WMMA_BM);
     gemm_prefill_qkv_w4a16_kernel<<<grid, 128, 0, stream>>>(
-        view, input_x, M
+        view, input_x, M, in_features, num_q_heads, num_kv_heads, head_dim
     );
     CUDA_KERNEL_CHECK();
 }
@@ -877,12 +901,14 @@ void launch_gemm_prefill_dual_gate_up_swiglu_w4a16(
     const half* input_x,
     half* output_mlp,
     int M,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int hidden_size,
+    int intermediate_size
 ) {
-    constexpr int TOTAL_N = 2 * INTERMEDIATE_SIZE; // 17,920
-    dim3 grid((TOTAL_N + PREFILL_WMMA_BN - 1) / PREFILL_WMMA_BN, (M + PREFILL_WMMA_BM - 1) / PREFILL_WMMA_BM);
+    int total_n = 2 * intermediate_size;
+    dim3 grid((total_n + PREFILL_WMMA_BN - 1) / PREFILL_WMMA_BN, (M + PREFILL_WMMA_BM - 1) / PREFILL_WMMA_BM);
     gemm_prefill_dual_gate_up_swiglu_w4a16_kernel<<<grid, 128, 0, stream>>>(
-        gate_up_qweight, gate_up_scales, input_x, output_mlp, M
+        gate_up_qweight, gate_up_scales, input_x, output_mlp, M, hidden_size, intermediate_size
     );
     CUDA_KERNEL_CHECK();
 }

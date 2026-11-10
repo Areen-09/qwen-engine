@@ -9,27 +9,35 @@ namespace qwen {
 
 // ----------------------------------------------------------------------------
 // GQA Split-K FlashDecoding Stage 1: Zero-Barrier Warp-per-Token
-// Grid: (NUM_KV_HEADS = 2, FLASH_DECODE_SPLITS = 16)
+// Grid: (num_kv_heads, FLASH_DECODE_SPLITS = 16)
 // Threads: 128 (4 warps: warp 0 .. 3)
 // Each 32-lane warp owns HEAD_DIM = 128 (4 elements per lane as uint2)
 // ----------------------------------------------------------------------------
+
+constexpr int MAX_GQA_GROUP = 16;
 
 __global__ void attention_gqa_flash_decode_stage1_kernel(
     const half* __restrict__ q,
     const half* __restrict__ layer_k_cache,
     const half* __restrict__ layer_v_cache,
-    float* __restrict__ splitk_partial_out, // [12, 16, 128]
-    float* __restrict__ splitk_partial_lse, // [12, 16, 2] -> [max_logit, sum_exp]
-    const DeviceControlBlock* __restrict__ d_control
+    float* __restrict__ splitk_partial_out,
+    float* __restrict__ splitk_partial_lse,
+    const DeviceControlBlock* __restrict__ d_control,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int max_seq_len
 ) {
-    int kv_head   = blockIdx.x; // 0 or 1
-    int split_idx = blockIdx.y; // 0 .. 15
+    int kv_head   = blockIdx.x;
+    int split_idx = blockIdx.y;
+
+    int gqa_group_size = num_q_heads / num_kv_heads;
 
     int seq_pos = 0;
     if (d_control != nullptr) {
         seq_pos = d_control->seq_pos;
     }
-    int seq_len = min(seq_pos + 1, MAX_SEQ_LEN);
+    int seq_len = min(seq_pos + 1, max_seq_len);
 
     int tokens_per_split = (seq_len + FLASH_DECODE_SPLITS - 1) / FLASH_DECODE_SPLITS;
     int split_start = split_idx * tokens_per_split;
@@ -40,11 +48,11 @@ __global__ void attention_gqa_flash_decode_stage1_kernel(
     int lane_id = tid % 32;
     int d_base  = lane_id * 4;
 
-    int q_head_base = kv_head * GQA_GROUP_SIZE; // 0 or 6
+    int q_head_base = kv_head * gqa_group_size;
 
     // Guard for empty split
     if (split_start >= split_end) {
-        if (tid < GQA_GROUP_SIZE) {
+        if (tid < gqa_group_size) {
             int q_h = q_head_base + tid;
             size_t lse_idx = (static_cast<size_t>(q_h) * FLASH_DECODE_SPLITS + split_idx) * 2;
             splitk_partial_lse[lse_idx + 0] = -INFINITY;
@@ -53,12 +61,10 @@ __global__ void attention_gqa_flash_decode_stage1_kernel(
         return;
     }
 
-    // Load all 6 Query vectors belonging to this KV head into per-lane registers
-    // Each lane holds 4 elements: q_reg[6][4]
-    float q_reg[GQA_GROUP_SIZE][4];
-    #pragma unroll
-    for (int h = 0; h < GQA_GROUP_SIZE; ++h) {
-        const half* q_h_ptr = q + static_cast<size_t>(q_head_base + h) * HEAD_DIM + d_base;
+    // Load Query vectors belonging to this KV head into per-lane registers
+    float q_reg[MAX_GQA_GROUP][4];
+    for (int h = 0; h < gqa_group_size; ++h) {
+        const half* q_h_ptr = q + static_cast<size_t>(q_head_base + h) * head_dim + d_base;
         uint2 raw_u2 = *reinterpret_cast<const uint2*>(q_h_ptr);
         const half* raw_h = reinterpret_cast<const half*>(&raw_u2);
         #pragma unroll
@@ -68,12 +74,11 @@ __global__ void attention_gqa_flash_decode_stage1_kernel(
     }
 
     // Per-warp online softmax accumulators
-    float m_i[GQA_GROUP_SIZE];
-    float d_i[GQA_GROUP_SIZE];
-    float o_reg[GQA_GROUP_SIZE][4];
+    float m_i[MAX_GQA_GROUP];
+    float d_i[MAX_GQA_GROUP];
+    float o_reg[MAX_GQA_GROUP][4];
 
-    #pragma unroll
-    for (int h = 0; h < GQA_GROUP_SIZE; ++h) {
+    for (int h = 0; h < gqa_group_size; ++h) {
         m_i[h] = -INFINITY;
         d_i[h] = 0.0f;
         #pragma unroll
@@ -86,7 +91,7 @@ __global__ void attention_gqa_flash_decode_stage1_kernel(
 
     // Inner loop: 4 warps stride by 4 with ZERO __syncthreads() barriers
     for (int t = split_start + warp_id; t < split_end; t += 4) {
-        size_t cache_base = (static_cast<size_t>(kv_head) * MAX_SEQ_LEN + t) * HEAD_DIM + d_base;
+        size_t cache_base = (static_cast<size_t>(kv_head) * max_seq_len + t) * head_dim + d_base;
 
         uint2 k_u2 = *reinterpret_cast<const uint2*>(layer_k_cache + cache_base);
         uint2 v_u2 = *reinterpret_cast<const uint2*>(layer_v_cache + cache_base);
@@ -101,8 +106,7 @@ __global__ void attention_gqa_flash_decode_stage1_kernel(
             v_val[p] = __half2float(v_h[p]);
         }
 
-        #pragma unroll
-        for (int h = 0; h < GQA_GROUP_SIZE; ++h) {
+        for (int h = 0; h < gqa_group_size; ++h) {
             float prod = q_reg[h][0] * k_val[0] +
                          q_reg[h][1] * k_val[1] +
                          q_reg[h][2] * k_val[2] +
@@ -129,18 +133,18 @@ __global__ void attention_gqa_flash_decode_stage1_kernel(
     }
 
     // Shared memory cross-warp reduction
-    __shared__ float s_m[GQA_GROUP_SIZE][4];
-    __shared__ float s_d[GQA_GROUP_SIZE][4];
+    __shared__ float s_m[MAX_GQA_GROUP][4];
+    __shared__ float s_d[MAX_GQA_GROUP][4];
     __shared__ float s_o[4][HEAD_DIM];
 
-    if (lane_id < GQA_GROUP_SIZE) {
+    if (lane_id < gqa_group_size) {
         s_m[lane_id][warp_id] = m_i[lane_id];
         s_d[lane_id][warp_id] = d_i[lane_id];
     }
     __syncthreads();
 
     // Merge each head sequentially
-    for (int h = 0; h < GQA_GROUP_SIZE; ++h) {
+    for (int h = 0; h < gqa_group_size; ++h) {
         // Store this warp's o_reg into shared memory
         #pragma unroll
         for (int p = 0; p < 4; ++p) {
@@ -164,8 +168,8 @@ __global__ void attention_gqa_flash_decode_stage1_kernel(
                 }
             }
 
-            // Stride across 128 elements in warp 0
-            for (int elem = lane_id; elem < HEAD_DIM; elem += 32) {
+            // Stride across elements in warp 0
+            for (int elem = lane_id; elem < head_dim; elem += 32) {
                 float merged_o = 0.0f;
                 if (d_total > 0.0f) {
                     for (int w = 0; w < 4; ++w) {
@@ -177,7 +181,7 @@ __global__ void attention_gqa_flash_decode_stage1_kernel(
                 }
 
                 int q_h = q_head_base + h;
-                size_t out_idx = (static_cast<size_t>(q_h) * FLASH_DECODE_SPLITS + split_idx) * HEAD_DIM + elem;
+                size_t out_idx = (static_cast<size_t>(q_h) * FLASH_DECODE_SPLITS + split_idx) * head_dim + elem;
                 splitk_partial_out[out_idx] = merged_o;
             }
 
@@ -313,10 +317,15 @@ __global__ void attention_gqa_prefill_kernel(
     const half* __restrict__ layer_v_cache,
     half* __restrict__ attn_out,
     const DeviceControlBlock* __restrict__ d_control,
-    int num_tokens
+    int num_tokens,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int max_seq_len,
+    int hidden_size
 ) {
-    int kv_h = blockIdx.x; // 0 or 1
-    int m    = blockIdx.y; // 0 .. num_tokens - 1
+    int kv_h = blockIdx.x;
+    int m    = blockIdx.y;
     if (m >= num_tokens) return;
 
     int tid = threadIdx.x;
@@ -324,20 +333,21 @@ __global__ void attention_gqa_prefill_kernel(
     int lane_id = tid % 32;
     int d_base  = lane_id * 4;
 
-    int q_head_base = kv_h * GQA_GROUP_SIZE; // 0 or 6
+    int gqa_group_size = num_q_heads / num_kv_heads;
+    int q_dim = num_q_heads * head_dim;
+    int q_head_base = kv_h * gqa_group_size;
 
     int base_pos = 0;
     if (d_control != nullptr) {
         base_pos = d_control->seq_pos;
     }
-    int cur_pos = min(base_pos + m, MAX_SEQ_LEN - 1);
+    int cur_pos = min(base_pos + m, max_seq_len - 1);
     int seq_len = cur_pos + 1;
 
-    // Load 6 Query vectors into registers
-    float q_reg[GQA_GROUP_SIZE][4];
-    #pragma unroll
-    for (int h = 0; h < GQA_GROUP_SIZE; ++h) {
-        size_t q_idx = static_cast<size_t>(m) * Q_DIM + (q_head_base + h) * HEAD_DIM + d_base;
+    // Load Query vectors into registers
+    float q_reg[MAX_GQA_GROUP][4];
+    for (int h = 0; h < gqa_group_size; ++h) {
+        size_t q_idx = static_cast<size_t>(m) * q_dim + (q_head_base + h) * head_dim + d_base;
         uint2 raw_u2 = *reinterpret_cast<const uint2*>(q + q_idx);
         const half* raw_h = reinterpret_cast<const half*>(&raw_u2);
         #pragma unroll
@@ -346,12 +356,11 @@ __global__ void attention_gqa_prefill_kernel(
         }
     }
 
-    float m_i[GQA_GROUP_SIZE];
-    float d_i[GQA_GROUP_SIZE];
-    float o_reg[GQA_GROUP_SIZE][4];
+    float m_i[MAX_GQA_GROUP];
+    float d_i[MAX_GQA_GROUP];
+    float o_reg[MAX_GQA_GROUP][4];
 
-    #pragma unroll
-    for (int h = 0; h < GQA_GROUP_SIZE; ++h) {
+    for (int h = 0; h < gqa_group_size; ++h) {
         m_i[h] = -INFINITY;
         d_i[h] = 0.0f;
         #pragma unroll
@@ -364,7 +373,7 @@ __global__ void attention_gqa_prefill_kernel(
 
     // Sweeping cached tokens: 4 warps stride by 4 with ZERO __syncthreads() barriers
     for (int t = warp_id; t < seq_len; t += 4) {
-        size_t cache_base = (static_cast<size_t>(kv_h) * MAX_SEQ_LEN + t) * HEAD_DIM + d_base;
+        size_t cache_base = (static_cast<size_t>(kv_h) * max_seq_len + t) * head_dim + d_base;
 
         uint2 k_u2 = *reinterpret_cast<const uint2*>(layer_k_cache + cache_base);
         uint2 v_u2 = *reinterpret_cast<const uint2*>(layer_v_cache + cache_base);
@@ -379,8 +388,7 @@ __global__ void attention_gqa_prefill_kernel(
             v_val[p] = __half2float(v_h[p]);
         }
 
-        #pragma unroll
-        for (int h = 0; h < GQA_GROUP_SIZE; ++h) {
+        for (int h = 0; h < gqa_group_size; ++h) {
             float prod = q_reg[h][0] * k_val[0] +
                          q_reg[h][1] * k_val[1] +
                          q_reg[h][2] * k_val[2] +
@@ -406,17 +414,17 @@ __global__ void attention_gqa_prefill_kernel(
     }
 
     // Shared memory cross-warp reduction
-    __shared__ float s_m[GQA_GROUP_SIZE][4];
-    __shared__ float s_d[GQA_GROUP_SIZE][4];
+    __shared__ float s_m[MAX_GQA_GROUP][4];
+    __shared__ float s_d[MAX_GQA_GROUP][4];
     __shared__ float s_o[4][HEAD_DIM];
 
-    if (lane_id < GQA_GROUP_SIZE) {
+    if (lane_id < gqa_group_size) {
         s_m[lane_id][warp_id] = m_i[lane_id];
         s_d[lane_id][warp_id] = d_i[lane_id];
     }
     __syncthreads();
 
-    for (int h = 0; h < GQA_GROUP_SIZE; ++h) {
+    for (int h = 0; h < gqa_group_size; ++h) {
         #pragma unroll
         for (int p = 0; p < 4; ++p) {
             s_o[warp_id][d_base + p] = o_reg[h][p];
@@ -438,7 +446,7 @@ __global__ void attention_gqa_prefill_kernel(
                 }
             }
 
-            for (int elem = lane_id; elem < HEAD_DIM; elem += 32) {
+            for (int elem = lane_id; elem < head_dim; elem += 32) {
                 float merged_o = 0.0f;
                 if (d_total > 0.0f) {
                     for (int w = 0; w < 4; ++w) {
@@ -450,7 +458,7 @@ __global__ void attention_gqa_prefill_kernel(
                 }
 
                 float final_val = (d_total > 0.0f) ? (merged_o / d_total) : 0.0f;
-                size_t out_idx = static_cast<size_t>(m) * Q_DIM + (q_head_base + h) * HEAD_DIM + elem;
+                size_t out_idx = static_cast<size_t>(m) * hidden_size + (q_head_base + h) * head_dim + elem;
                 attn_out[out_idx] = __float2half(final_val);
             }
         }
@@ -471,17 +479,22 @@ void launch_attention_gqa_flash_decode(
     half* attn_out,
     const DeviceControlBlock* d_control,
     cudaStream_t stream,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int max_seq_len,
     int8_t* out_q8,
     float* out_scale,
     int32_t* out_sum8
 ) {
-    dim3 grid_stage1(NUM_KV_HEADS, FLASH_DECODE_SPLITS); // 2 x 16 = 32 blocks
+    dim3 grid_stage1(num_kv_heads, FLASH_DECODE_SPLITS);
     attention_gqa_flash_decode_stage1_kernel<<<grid_stage1, 128, 0, stream>>>(
-        q, layer_k_cache, layer_v_cache, splitk_partial_out, splitk_partial_lse, d_control
+        q, layer_k_cache, layer_v_cache, splitk_partial_out, splitk_partial_lse, d_control,
+        num_q_heads, num_kv_heads, head_dim, max_seq_len
     );
     CUDA_KERNEL_CHECK();
 
-    dim3 grid_stage2(NUM_Q_HEADS, 1); // 12 blocks
+    dim3 grid_stage2(num_q_heads, 1);
     attention_gqa_flash_decode_stage2_kernel<<<grid_stage2, 128, 0, stream>>>(
         splitk_partial_out, splitk_partial_lse, attn_out, out_q8, out_scale, out_sum8
     );
@@ -495,11 +508,17 @@ void launch_attention_gqa_prefill(
     half* attn_out,
     const DeviceControlBlock* d_control,
     int num_tokens,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int max_seq_len,
+    int hidden_size
 ) {
-    dim3 grid(NUM_KV_HEADS, num_tokens);
+    dim3 grid(num_kv_heads, num_tokens);
     attention_gqa_prefill_kernel<<<grid, 128, 0, stream>>>(
-        q, layer_k_cache, layer_v_cache, attn_out, d_control, num_tokens
+        q, layer_k_cache, layer_v_cache, attn_out, d_control, num_tokens,
+        num_q_heads, num_kv_heads, head_dim, max_seq_len, hidden_size
     );
     CUDA_KERNEL_CHECK();
 }
