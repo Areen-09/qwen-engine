@@ -370,7 +370,9 @@ __global__ void qkv_bias_rope_kv_append_kernel(
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
-    int max_seq_len
+    int max_seq_len,
+    int rotary_dim,
+    float rope_theta
 ) {
     int m = blockIdx.x;
     if (m >= num_tokens) return;
@@ -406,42 +408,44 @@ __global__ void qkv_bias_rope_kv_append_kernel(
         if (vb_h2) vm_h2[i] = __hadd2(vm_h2[i], vb_h2[i]);
     }
 
-    // Shared memory staging for 64 RoPE angles (head_dim / 2)
+    // Shared memory staging for RoPE angles (half_rotary <= 64)
+    int eff_rotary = (rotary_dim > 0 && rotary_dim <= head_dim) ? rotary_dim : head_dim;
+    int half_rotary = eff_rotary / 2;
     __shared__ float s_sin[64];
     __shared__ float s_cos[64];
 
-    if (threadIdx.x < 64) {
+    if (threadIdx.x < half_rotary) {
         int coord_i = threadIdx.x;
-        float exponent = -2.0f * static_cast<float>(coord_i) / static_cast<float>(head_dim);
-        float theta = exp2f(exponent * LOG2_ROPE_THETA);
+        float exponent = -2.0f * static_cast<float>(coord_i) / static_cast<float>(eff_rotary);
+        float log2_theta = log2f(rope_theta);
+        float theta = exp2f(exponent * log2_theta);
         float angle = static_cast<float>(pos) * theta;
         __sincosf(angle, &s_sin[coord_i], &s_cos[coord_i]);
     }
     __syncthreads();
 
-    // 2. NeoX Split-Half RoPE using precomputed shared angles
-    int half_head = head_dim / 2; // 64
-    int total_q_pairs = num_q_heads * half_head;
-    int total_k_pairs = num_kv_heads * half_head;
+    // 2. Partial RoPE using precomputed shared angles on [0, half_rotary)
+    int total_q_pairs = num_q_heads * half_rotary;
+    int total_k_pairs = num_kv_heads * half_rotary;
     int total_pairs   = total_q_pairs + total_k_pairs;
 
     for (int pair_idx = threadIdx.x; pair_idx < total_pairs; pair_idx += blockDim.x) {
         bool is_q = (pair_idx < total_q_pairs);
-        int head_idx = is_q ? (pair_idx / half_head) : ((pair_idx - total_q_pairs) / half_head);
-        int coord_i  = pair_idx % half_head; // 0 .. 63
+        int head_idx = is_q ? (pair_idx / half_rotary) : ((pair_idx - total_q_pairs) / half_rotary);
+        int coord_i  = pair_idx % half_rotary;
 
         float sin_val = s_sin[coord_i];
         float cos_val = s_cos[coord_i];
 
         half* head_ptr = is_q ? (q_m + head_idx * head_dim) : (k_m + head_idx * head_dim);
         float x0 = __half2float(head_ptr[coord_i]);
-        float x1 = __half2float(head_ptr[coord_i + half_head]);
+        float x1 = __half2float(head_ptr[coord_i + half_rotary]);
 
         float rot0 = x0 * cos_val - x1 * sin_val;
         float rot1 = x0 * sin_val + x1 * cos_val;
 
-        head_ptr[coord_i]             = __float2half(rot0);
-        head_ptr[coord_i + half_head] = __float2half(rot1);
+        head_ptr[coord_i]               = __float2half(rot0);
+        head_ptr[coord_i + half_rotary] = __float2half(rot1);
     }
     __syncthreads();
 
@@ -472,11 +476,14 @@ void launch_qkv_bias_rope_kv_append(
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
-    int max_seq_len
+    int max_seq_len,
+    int rotary_dim,
+    float rope_theta
 ) {
+    if (rotary_dim <= 0) rotary_dim = head_dim;
     qkv_bias_rope_kv_append_kernel<<<num_tokens, 256, 0, stream>>>(
         q, k, v, q_bias, k_bias, v_bias, layer_k_cache, layer_v_cache, d_control, num_tokens,
-        num_q_heads, num_kv_heads, head_dim, max_seq_len
+        num_q_heads, num_kv_heads, head_dim, max_seq_len, rotary_dim, rope_theta
     );
     CUDA_KERNEL_CHECK();
 }

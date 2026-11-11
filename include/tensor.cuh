@@ -33,6 +33,11 @@ struct alignas(256) DeviceControlBlock {
     uint64_t rng_seed;
 };
 
+struct PinnedCandidate {
+    float val;
+    int32_t idx;
+};
+
 // Static single-cudaMalloc memory arena
 class GpuArena {
 public:

@@ -6,11 +6,16 @@
 #include <stdexcept>
 #include <mutex>
 #include <atomic>
-#include <condition_variable>
+#include <cstring>
+#include <thread>
+
+#if defined(_MSC_VER) || defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+#include <immintrin.h>
+#endif
 
 namespace qwen {
 
-// Kernel for elementwise sum reduction between local and peer buffers
+// Kernel for elementwise sum reduction between local and peer buffers (Direct P2P)
 template <typename T>
 __global__ void vector_add_kernel(T* __restrict__ dst, const T* __restrict__ src, size_t count) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -27,18 +32,61 @@ __global__ void vector_add_kernel<half>(half* __restrict__ dst, const half* __re
     }
 }
 
-struct P2PSharedState {
+// ----------------------------------------------------------------------------
+// AVX2 Vectorized Half-Precision Summation on Host
+// ----------------------------------------------------------------------------
+#if defined(__AVX2__) || defined(_M_AMD64)
+void avx2_vector_add_half(half* dst, const half* src, size_t count) {
+    size_t i = 0;
+    size_t count8 = (count / 8) * 8;
+    for (; i < count8; i += 8) {
+        __m128i h_dst = _mm_loadu_si128(reinterpret_cast<const __m128i*>(dst + i));
+        __m128i h_src = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));
+        __m256 f_dst = _mm256_cvtph_ps(h_dst);
+        __m256 f_src = _mm256_cvtph_ps(h_src);
+        __m256 f_sum = _mm256_add_ps(f_dst, f_src);
+        __m128i h_sum = _mm256_cvtps_ph(f_sum, 0); // 0 = round to nearest even
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), h_sum);
+    }
+    for (; i < count; ++i) {
+        float s = __half2float(dst[i]) + __half2float(src[i]);
+        dst[i] = __float2half(s);
+    }
+}
+#else
+void avx2_vector_add_half(half* dst, const half* src, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        float s = __half2float(dst[i]) + __half2float(src[i]);
+        dst[i] = __float2half(s);
+    }
+}
+#endif
+
+// ----------------------------------------------------------------------------
+// Adaptive Two-Phase Spin-Yield Helper
+// ----------------------------------------------------------------------------
+template <typename Predicate>
+inline void spin_yield_wait(Predicate&& pred) {
+    for (int spin = 0; spin < 256; ++spin) {
+        if (pred()) return;
+        #if defined(_MSC_VER) || defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+        _mm_pause();
+        #endif
+    }
+    while (!pred()) {
+        std::this_thread::yield();
+    }
+}
+
+struct P2PDirectState {
     std::mutex mtx;
-    std::condition_variable cv;
-    int step_counter{0};
-    void* host_staging[2]{nullptr, nullptr};
     void* device_peer_buf[2]{nullptr, nullptr};
     cudaEvent_t peer_events[2]{nullptr, nullptr};
-    size_t current_count{0};
-    DataType current_type{DataType::FP16};
 };
 
-static P2PSharedState g_p2p_state;
+static P2PDirectState g_p2p_direct_state;
+static std::shared_ptr<HostStagingChannel> g_default_host_channel = nullptr;
+static std::mutex g_host_channel_init_mtx;
 
 class P2PCommunicator : public ICommunicator {
 public:
@@ -46,14 +94,16 @@ public:
         int rank,
         int world_size,
         const std::vector<int>& device_ids,
-        bool force_staging
+        bool force_staging,
+        std::shared_ptr<HostStagingChannel> shared_channel
     ) : rank_(rank),
         world_size_(world_size),
         device_ids_(device_ids),
         peer_accessible_(false),
         d_peer_staging_(nullptr),
-        h_host_staging_(nullptr),
-        local_event_(nullptr) {
+        local_event_(nullptr),
+        channel_(shared_channel),
+        epoch_(0) {
 
         if (world_size_ <= 1) {
             peer_accessible_ = true;
@@ -71,28 +121,39 @@ public:
         if (can_access && !force_staging) {
             cudaError_t err = cudaDeviceEnablePeerAccess(peer_dev, 0);
             if (err == cudaSuccess || err == cudaErrorPeerAccessAlreadyEnabled) {
-                cudaGetLastError(); // clear error if already enabled
+                cudaGetLastError();
                 peer_accessible_ = true;
             }
         }
 
-        // Allocate 64 MB staging buffer
-        size_t max_bytes = 64ULL << 20;
+        size_t max_bytes = 16ULL << 20; // 16 MB staging buffer per slot
         if (peer_accessible_) {
             CUDA_CHECK(cudaMalloc(&d_peer_staging_, max_bytes));
             CUDA_CHECK(cudaEventCreateWithFlags(&local_event_, cudaEventDisableTiming));
 
-            std::unique_lock<std::mutex> lock(g_p2p_state.mtx);
-            g_p2p_state.device_peer_buf[rank_] = d_peer_staging_;
-            g_p2p_state.peer_events[rank_] = local_event_;
+            std::unique_lock<std::mutex> lock(g_p2p_direct_state.mtx);
+            g_p2p_direct_state.device_peer_buf[rank_] = d_peer_staging_;
+            g_p2p_direct_state.peer_events[rank_] = local_event_;
             std::cout << "[P2PCommunicator] Rank " << rank_
                       << " enabled direct BAR1 P2P with device " << peer_dev << "." << std::endl;
         } else {
-            CUDA_CHECK(cudaHostAlloc(&h_host_staging_, max_bytes, cudaHostAllocMapped));
-            std::unique_lock<std::mutex> lock(g_p2p_state.mtx);
-            g_p2p_state.host_staging[rank_] = h_host_staging_;
+            // Setup HostStagingChannel
+            std::unique_lock<std::mutex> lock(g_host_channel_init_mtx);
+            if (!channel_) {
+                if (!g_default_host_channel) {
+                    g_default_host_channel = std::make_shared<HostStagingChannel>();
+                }
+                channel_ = g_default_host_channel;
+            }
+
+            for (int e = 0; e < 2; ++e) {
+                if (!channel_->host_buf[e][rank_]) {
+                    CUDA_CHECK(cudaHostAlloc(&channel_->host_buf[e][rank_], max_bytes, cudaHostAllocMapped));
+                }
+            }
+
             std::cout << "[P2PCommunicator] Rank " << rank_
-                      << " fallback to double-buffered host staging." << std::endl;
+                      << " initialized double-buffered host staging with AVX2 All-Reduce." << std::endl;
         }
     }
 
@@ -104,14 +165,11 @@ public:
             cudaFree(d_peer_staging_);
             d_peer_staging_ = nullptr;
         }
-        if (h_host_staging_) {
-            cudaFreeHost(h_host_staging_);
-            h_host_staging_ = nullptr;
-        }
         if (local_event_) {
             cudaEventDestroy(local_event_);
             local_event_ = nullptr;
         }
+        // Note: host_buf allocations are freed upon process exit or can be freed if channel unique
     }
 
     void all_reduce_sum(void* sendrecvbuf, size_t count, DataType type, cudaStream_t stream) override {
@@ -124,26 +182,19 @@ public:
         if (peer_accessible_) {
             // Direct P2P All-Reduce path (CUDA Graph capture compatible)
             int peer_rank = 1 - rank_;
-            void* peer_staging = g_p2p_state.device_peer_buf[peer_rank];
-            cudaEvent_t peer_event = g_p2p_state.peer_events[peer_rank];
+            void* peer_staging = g_p2p_direct_state.device_peer_buf[peer_rank];
+            cudaEvent_t peer_event = g_p2p_direct_state.peer_events[peer_rank];
 
             if (!peer_staging || !peer_event) {
-                // Peer rank has not registered its staging buffer in this process
                 return;
             }
 
-            // 1. Copy local buffer into peer's staging buffer across PCIe BAR1
             CUDA_CHECK(cudaMemcpyPeerAsync(peer_staging, device_ids_[peer_rank],
                                            sendrecvbuf, device_ids_[rank_],
                                            bytes, stream));
-
-            // 2. Record completion event on local stream
             CUDA_CHECK(cudaEventRecord(local_event_, stream));
-
-            // 3. Wait on peer's copy completion
             CUDA_CHECK(cudaStreamWaitEvent(stream, peer_event, 0));
 
-            // 4. Elementwise add peer's contribution into local sendrecvbuf
             int block = 256;
             int grid = static_cast<int>((count + block - 1) / block);
             if (type == DataType::FP16) {
@@ -166,55 +217,67 @@ public:
                 );
             }
         } else {
-            // Host-pinned staging buffer fallback (host synchronized)
-            CUDA_CHECK(cudaMemcpyAsync(h_host_staging_, sendrecvbuf, bytes, cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-
-            // Host rendezvous barrier
-            {
-                std::unique_lock<std::mutex> lock(g_p2p_state.mtx);
-                if (!g_p2p_state.host_staging[0] || !g_p2p_state.host_staging[1]) {
-                    // Both host staging buffers not yet allocated; skip host reduction
-                    return;
-                }
-                int cur_step = g_p2p_state.step_counter;
-                g_p2p_state.current_count = count;
-                g_p2p_state.current_type = type;
-
-                if (rank_ == 0) {
-                    g_p2p_state.step_counter++;
-                    g_p2p_state.cv.wait(lock, [&]() {
-                        return g_p2p_state.step_counter == cur_step + 2;
-                    });
-                } else {
-                    // Rank 1 performs the summation in host memory
-                    void* h0 = g_p2p_state.host_staging[0];
-                    void* h1 = g_p2p_state.host_staging[1];
-
-                    if (type == DataType::FP16) {
-                        half* h0_ptr = reinterpret_cast<half*>(h0);
-                        half* h1_ptr = reinterpret_cast<half*>(h1);
-                        for (size_t i = 0; i < count; ++i) {
-                            float s = __half2float(h0_ptr[i]) + __half2float(h1_ptr[i]);
-                            h0_ptr[i] = __float2half(s);
-                            h1_ptr[i] = h0_ptr[i];
-                        }
-                    } else if (type == DataType::FP32) {
-                        float* h0_ptr = reinterpret_cast<float*>(h0);
-                        float* h1_ptr = reinterpret_cast<float*>(h1);
-                        for (size_t i = 0; i < count; ++i) {
-                            float s = h0_ptr[i] + h1_ptr[i];
-                            h0_ptr[i] = s;
-                            h1_ptr[i] = s;
-                        }
-                    }
-                    g_p2p_state.step_counter++;
-                    g_p2p_state.cv.notify_all();
-                }
+            if (!channel_ || !channel_->host_buf[epoch_][0] || !channel_->host_buf[epoch_][1]) {
+                return;
             }
 
-            // Copy sum back to device
-            CUDA_CHECK(cudaMemcpyAsync(sendrecvbuf, h_host_staging_, bytes, cudaMemcpyHostToDevice, stream));
+            // 0. Ensure epoch's buffers are vacated from previous cycle
+            spin_yield_wait([&]() {
+                return channel_->exit_epoch[epoch_].load(std::memory_order_acquire) == 2;
+            });
+
+            // 1. Asynchronously copy local device buffer to host pinned buffer
+            CUDA_CHECK(cudaMemcpyAsync(channel_->host_buf[epoch_][rank_], sendrecvbuf, bytes, cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            // 2. Rendezvous arrival
+            channel_->arrival_epoch[epoch_].fetch_add(1, std::memory_order_release);
+            spin_yield_wait([&]() {
+                return channel_->arrival_epoch[epoch_].load(std::memory_order_acquire) == 2;
+            });
+
+            // 3. Reduction & broadcast
+            if (rank_ == 0) {
+                channel_->exit_epoch[epoch_].store(0, std::memory_order_relaxed);
+
+                if (type == DataType::FP16) {
+                    avx2_vector_add_half(
+                        reinterpret_cast<half*>(channel_->host_buf[epoch_][0]),
+                        reinterpret_cast<const half*>(channel_->host_buf[epoch_][1]),
+                        count
+                    );
+                } else if (type == DataType::FP32) {
+                    float* h0 = reinterpret_cast<float*>(channel_->host_buf[epoch_][0]);
+                    const float* h1 = reinterpret_cast<const float*>(channel_->host_buf[epoch_][1]);
+                    for (size_t i = 0; i < count; ++i) h0[i] += h1[i];
+                }
+
+                // Broadcast reduced sum to rank 1 host buffer
+                std::memcpy(channel_->host_buf[epoch_][1], channel_->host_buf[epoch_][0], bytes);
+
+                // Publish completion
+                channel_->completion_epoch[epoch_].store(1, std::memory_order_release);
+            } else {
+                // Rank 1 waits for Rank 0 completion
+                spin_yield_wait([&]() {
+                    return channel_->completion_epoch[epoch_].load(std::memory_order_acquire) == 1;
+                });
+            }
+
+            // 4. Async copy reduced sum back to local device buffer
+            CUDA_CHECK(cudaMemcpyAsync(sendrecvbuf, channel_->host_buf[epoch_][rank_], bytes, cudaMemcpyHostToDevice, stream));
+
+            // 5. Exit handshake
+            channel_->exit_epoch[epoch_].fetch_add(1, std::memory_order_release);
+            if (rank_ == 0) {
+                spin_yield_wait([&]() {
+                    return channel_->exit_epoch[epoch_].load(std::memory_order_acquire) == 2;
+                });
+                channel_->arrival_epoch[epoch_].store(0, std::memory_order_relaxed);
+                channel_->completion_epoch[epoch_].store(0, std::memory_order_relaxed);
+            }
+
+            epoch_ = 1 - epoch_;
         }
     }
 
@@ -233,18 +296,19 @@ private:
     std::vector<int> device_ids_;
     bool peer_accessible_;
     void* d_peer_staging_;
-    void* h_host_staging_;
     cudaEvent_t local_event_;
+    std::shared_ptr<HostStagingChannel> channel_;
+    int epoch_;
 };
 
 std::unique_ptr<ICommunicator> create_communicator(
     int rank,
     int world_size,
     const std::vector<int>& device_ids,
-    bool force_staging
+    bool force_staging,
+    std::shared_ptr<HostStagingChannel> shared_channel
 ) {
-    return std::make_unique<P2PCommunicator>(rank, world_size, device_ids, force_staging);
+    return std::make_unique<P2PCommunicator>(rank, world_size, device_ids, force_staging, shared_channel);
 }
 
 } // namespace qwen
-

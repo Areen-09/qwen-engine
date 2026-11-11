@@ -26,6 +26,7 @@ void QwenTokenizer::load_tokenizer_buffer(const void* buffer, size_t size) {
     if (header->magic != 0x51544F4B) {
         throw std::runtime_error("QwenTokenizer: Invalid magic number in memory buffer");
     }
+    eos_id_ = static_cast<int32_t>(header->eos_id);
     ptr += sizeof(TokenizerBinHeader);
 
     vocab_pieces_.resize(header->vocab_size);
@@ -77,6 +78,7 @@ void QwenTokenizer::load_tokenizer_bin(const std::string& path) {
     if (!file || header.magic != 0x51544F4B) {
         throw std::runtime_error("QwenTokenizer: Invalid magic number in " + path);
     }
+    eos_id_ = static_cast<int32_t>(header.eos_id);
 
     vocab_pieces_.resize(header.vocab_size);
     for (uint32_t i = 0; i < header.vocab_size; ++i) {

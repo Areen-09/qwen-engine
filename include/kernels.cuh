@@ -222,7 +222,7 @@ void launch_gemm_prefill_dual_gate_up_swiglu_w4a16(
     int intermediate_size = INTERMEDIATE_SIZE
 );
 
-// 6. QKV Bias + NeoX Split-Half RoPE + KV Cache write
+// 6. QKV Bias + NeoX Split-Half RoPE + KV Cache write (with Partial RoPE support)
 void launch_qkv_bias_rope_kv_append(
     half* q,
     half* k,
@@ -238,7 +238,27 @@ void launch_qkv_bias_rope_kv_append(
     int num_q_heads = NUM_Q_HEADS,
     int num_kv_heads = NUM_KV_HEADS,
     int head_dim = HEAD_DIM,
-    int max_seq_len = MAX_SEQ_LEN
+    int max_seq_len = MAX_SEQ_LEN,
+    int rotary_dim = 0,
+    float rope_theta = ROPE_THETA
+);
+
+// 6b. Gated DeltaNet Recurrent Step (Conv1d + 16 KB SMEM Sub-tiled Delta recurrence)
+void launch_deltanet_step(
+    const half* input,
+    const half* conv1d_weight,
+    const half* conv1d_bias,
+    half* conv_state,
+    const half* q,
+    const half* k,
+    const half* v,
+    const half* beta,
+    float* s_state,
+    half* out,
+    int hidden_size,
+    int num_heads,
+    int head_dim,
+    cudaStream_t stream
 );
 
 // 7. GQA FlashDecoding & Causal Prefill Attention
@@ -284,6 +304,17 @@ void launch_sample_and_advance(
     int32_t* d_mapped_pinned_token,
     cudaStream_t stream,
     int vocab_size = VOCAB_SIZE
+);
+
+void launch_sample_candidate(
+    const half* logits,
+    float* sample_scratch_val,
+    int32_t* sample_scratch_idx,
+    const DeviceControlBlock* d_control,
+    PinnedCandidate* d_out_cand,
+    int32_t index_offset,
+    int vocab_size,
+    cudaStream_t stream
 );
 
 } // namespace qwen

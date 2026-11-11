@@ -81,7 +81,13 @@ models/*.bin
 
 # Logs and Scratch Files
 scratch/
+scripts/
 *.log
 *.tmp
 *.bak
+
+# Notebooks
+*.ipynb
+notebooks/
+
 

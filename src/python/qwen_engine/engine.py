@@ -96,7 +96,17 @@ class Engine:
 
         self._tokenizer = _core.NativeTokenizer(self._tokenizer_path)
         if len(self._device_ids) > 1:
+            print(f"[QwenEngine] Initializing Multi-GPU Tensor Parallelism (TP={len(self._device_ids)}) across devices: {self._device_ids}")
+            if "rank0" in self._model_path:
+                rank1_expected = self._model_path.replace("rank0", "rank1")
+                if os.path.exists(rank1_expected):
+                    print(f"  - Rank 0: {self._model_path} -> cuda:{self._device_ids[0]}")
+                    print(f"  - Rank 1: {rank1_expected} -> cuda:{self._device_ids[1]}")
+                else:
+                    print(f"  - [Warning] Expected Rank 1 container not found at {rank1_expected}")
             self._engine = _core.NativeEngine(self._model_path, self._device_ids)
+            stats = self._engine.get_memory_stats()
+            print(f"[QwenEngine] Primary GPU Arena Allocated: {stats.total_allocated_bytes / (1024*1024):.2f} MB. VRAM Free: {stats.device_free_bytes / (1024*1024):.2f} MB")
         else:
             self._engine = _core.NativeEngine(self._model_path, self._device_id)
 

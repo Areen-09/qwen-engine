@@ -13,8 +13,18 @@
 #include <string>
 #include <memory>
 #include <atomic>
+#include <thread>
 
 namespace qwen {
+
+enum class WorkerOp : uint32_t {
+    IDLE = 0,
+    PREFILL_CHUNK,
+    DECODE_PASS,
+    RESET,
+    ROLLBACK,
+    SHUTDOWN
+};
 
 struct LayerWeights {
     // Normalization
@@ -73,6 +83,48 @@ struct WorkspaceBuffers {
     // DeltaNet intermediate buffer
     half*     d_deltanet_in{nullptr};
     half*     d_deltanet_beta{nullptr};
+};
+
+struct CompanionRankState {
+    int device_id{1};
+    int rank{1};
+    std::string qwenbin_path;
+    std::unique_ptr<PlatformFileMap> file_map;
+    const uint8_t* mapped_data{nullptr};
+    size_t mapped_size{0};
+    ModelConfig model_config;
+    QuantMode quant_mode{QuantMode::FP16};
+    std::unique_ptr<GpuArena> arena;
+    cudaStream_t stream{nullptr};
+
+    const void*  d_embed_weight{nullptr};
+    const half*  d_embed_scale{nullptr};
+    const void*  d_lm_head_weight{nullptr};
+    const half*  d_lm_head_scale{nullptr};
+    const half*  d_final_norm{nullptr};
+    std::vector<LayerWeights> layers;
+
+    half* d_k_cache{nullptr};
+    half* d_v_cache{nullptr};
+    std::vector<int> gqa_layer_idx;
+    size_t num_gqa_layers{0};
+
+    float* d_deltanet_state{nullptr};
+    half* d_conv1d_state{nullptr};
+    size_t num_deltanet_layers{0};
+
+    WorkspaceBuffers ws;
+    DeviceControlBlock* d_control{nullptr};
+    int32_t* h_pinned_token{nullptr};
+    int32_t* d_mapped_pinned_token{nullptr};
+    PinnedCandidate* h_pinned_cand{nullptr};
+    PinnedCandidate* d_mapped_pinned_cand{nullptr};
+
+    std::unique_ptr<ICommunicator> comm;
+
+    alignas(64) std::atomic<float> top_val{-1e30f};
+    alignas(64) std::atomic<int32_t> top_idx{-1};
+    alignas(64) std::atomic<int32_t> chosen_token{-1};
 };
 
 struct StageBreakdown {
@@ -173,6 +225,8 @@ public:
     const LayerWeights& layer_weights(int l) const { return layers_[l]; }
     const void* embed_weight() const { return d_embed_weight_; }
     const half* embed_scale() const { return d_embed_scale_; }
+    const void* lm_head_weight() const { return d_lm_head_weight_; }
+    const half* lm_head_scale() const { return d_lm_head_scale_; }
     const half* final_norm() const { return d_final_norm_; }
     const WorkspaceBuffers& workspace() const { return ws_; }
     DeviceControlBlock* control_block() const { return d_control_; }
@@ -210,6 +264,8 @@ private:
     // Model weight device pointers
     const void*  d_embed_weight_{nullptr};
     const half*  d_embed_scale_{nullptr};
+    const void*  d_lm_head_weight_{nullptr};
+    const half*  d_lm_head_scale_{nullptr};
     const half*  d_final_norm_{nullptr};
     std::vector<LayerWeights> layers_;
 
@@ -230,6 +286,8 @@ private:
     DeviceControlBlock* d_control_{nullptr};
     int32_t* h_pinned_token_{nullptr};
     int32_t* d_mapped_pinned_token_{nullptr};
+    PinnedCandidate* h_pinned_cand_{nullptr};
+    PinnedCandidate* d_mapped_pinned_cand_{nullptr};
 
     // Communicator for multi-GPU Tensor Parallelism
     std::unique_ptr<ICommunicator> comm_;
@@ -249,6 +307,29 @@ private:
     size_t weights_bytes_{0};
     size_t kv_cache_bytes_{0};
     size_t workspace_bytes_{0};
+
+    // Multi-GPU Companion Worker Thread & Host Staging Channel
+    std::shared_ptr<HostStagingChannel> staging_channel_;
+    CompanionRankState rank1_;
+    std::jthread worker_thread_;
+    alignas(64) std::atomic<uint32_t> worker_op_{0};
+    alignas(64) std::atomic<uint32_t> worker_ack_{0};
+    std::atomic<int32_t> worker_chunk_start_{0};
+    std::atomic<int32_t> worker_chunk_len_{0};
+    std::atomic<int32_t> worker_target_pos_{0};
+
+    void worker_loop(std::stop_token st);
+    void init_rank1();
+    void cleanup_rank1();
+    void execute_rank1_decode_pass();
+    void execute_rank1_prefill_chunk(int chunk_start, int chunk_len);
+    void execute_rank1_gqa_decode_layer(int l);
+    void execute_rank1_deltanet_decode_layer(int l);
+    void execute_rank1_gqa_prefill_layer(int l, int chunk_start, int chunk_len);
+    void execute_rank1_deltanet_prefill_layer(int l, int chunk_start, int chunk_len);
+
+    void dispatch_worker(WorkerOp op);
+    void wait_worker_done();
 };
 
 } // namespace qwen

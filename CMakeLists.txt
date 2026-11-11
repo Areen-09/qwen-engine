@@ -34,22 +34,26 @@ if(MSVC)
         $<$<COMPILE_LANGUAGE:CXX>:/permissive->
         $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
         $<$<COMPILE_LANGUAGE:CXX>:/Z7>
+        $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>
         $<$<COMPILE_LANGUAGE:CUDA>:-O3>
         $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
         $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/W4,/O2,/EHsc,/permissive-,/utf-8,/Z7>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/W4,/O2,/EHsc,/permissive-,/utf-8,/Z7,/arch:AVX2>
     )
 else()
     add_compile_options(
         $<$<COMPILE_LANGUAGE:CXX>:-Wall>
         $<$<COMPILE_LANGUAGE:CXX>:-Wextra>
         $<$<COMPILE_LANGUAGE:CXX>:-O3>
+        $<$<COMPILE_LANGUAGE:CXX>:-mavx2>
+        $<$<COMPILE_LANGUAGE:CXX>:-mf16c>
         $<$<COMPILE_LANGUAGE:CUDA>:-O3>
         $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
         $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
         $<$<COMPILE_LANGUAGE:CUDA>:-allow-unsupported-compiler>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-mavx2,-mf16c>
     )
 endif()
 

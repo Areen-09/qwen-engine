@@ -1,10 +1,12 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
 #include <memory>
+#include <atomic>
 
 namespace qwen {
 
@@ -13,6 +15,15 @@ enum class DataType : uint32_t {
     FP32 = 1,
     INT32 = 2
 };
+
+struct HostStagingChannel {
+    void* host_buf[2][2]{ {nullptr, nullptr}, {nullptr, nullptr} };
+    alignas(64) std::atomic<int> arrival_epoch[2]{0, 0};
+    alignas(64) std::atomic<int> completion_epoch[2]{0, 0};
+    alignas(64) std::atomic<int> exit_epoch[2]{2, 2};
+};
+
+void avx2_vector_add_half(half* dst, const half* src, size_t count);
 
 class ICommunicator {
 public:
@@ -34,7 +45,8 @@ std::unique_ptr<ICommunicator> create_communicator(
     int rank,
     int world_size,
     const std::vector<int>& device_ids,
-    bool force_staging = false
+    bool force_staging = false,
+    std::shared_ptr<HostStagingChannel> shared_channel = nullptr
 );
 
 } // namespace qwen

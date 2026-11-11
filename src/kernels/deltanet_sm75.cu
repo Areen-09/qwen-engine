@@ -1,4 +1,5 @@
 #include "deltanet.cuh"
+#include "kernels.cuh"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cmath>
@@ -204,6 +205,33 @@ void launch_depthwise_conv1d_step(
     int grid = (num_channels + block - 1) / block;
     depthwise_conv1d_step_kernel<<<grid, block, 0, stream>>>(
         in, weight, bias, conv_state, out, num_channels, kernel_size
+    );
+}
+
+void launch_deltanet_step(
+    const half* input,
+    const half* conv1d_weight,
+    const half* conv1d_bias,
+    half* conv_state,
+    const half* q,
+    const half* k,
+    const half* v,
+    const half* beta,
+    float* s_state,
+    half* out,
+    int hidden_size,
+    int num_heads,
+    int head_dim,
+    cudaStream_t stream
+) {
+    if (conv1d_weight != nullptr) {
+        launch_depthwise_conv1d_step(
+            input, conv1d_weight, conv1d_bias, conv_state,
+            const_cast<half*>(input), hidden_size, 4, stream
+        );
+    }
+    launch_deltanet_decode_sm75(
+        q, k, v, beta, s_state, out, 1, num_heads, head_dim, stream
     );
 }
 

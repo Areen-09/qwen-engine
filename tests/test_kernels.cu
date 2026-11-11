@@ -647,6 +647,277 @@ bool run_synthetic_conv1d_suite() {
     return true;
 }
 
+// [Synthetic Suite 6] Standalone Split-K FlashDecoding at head_dim = 256
+bool run_synthetic_flash_decode_256_suite() {
+    std::cout << "\n[Synthetic Suite 6] Testing FlashDecoding Stage 1 & 2 (head_dim = 256, GQA 4:1)..." << std::endl;
+    constexpr int num_q_heads = 4;
+    constexpr int num_kv_heads = 1;
+    constexpr int head_dim = 256;
+    constexpr int max_seq_len = 64;
+    constexpr int seq_pos = 15; // 16 tokens evaluated
+    constexpr int seq_len = seq_pos + 1;
+
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dis(-0.25f, 0.25f);
+
+    std::vector<half> h_q(num_q_heads * head_dim);
+    std::vector<half> h_k_cache(num_kv_heads * max_seq_len * head_dim, __float2half(0.0f));
+    std::vector<half> h_v_cache(num_kv_heads * max_seq_len * head_dim, __float2half(0.0f));
+    std::vector<half> h_out_ref(num_q_heads * head_dim);
+
+    for (size_t i = 0; i < h_q.size(); ++i) h_q[i] = __float2half(dis(gen));
+    for (int t = 0; t < seq_len; ++t) {
+        for (int d = 0; d < head_dim; ++d) {
+            h_k_cache[t * head_dim + d] = __float2half(dis(gen));
+            h_v_cache[t * head_dim + d] = __float2half(dis(gen));
+        }
+    }
+
+    // CPU reference attention
+    float scale = 1.0f / std::sqrt(static_cast<float>(head_dim)); // 0.0625f
+    for (int qh = 0; qh < num_q_heads; ++qh) {
+        std::vector<float> scores(seq_len);
+        float m_max = -INFINITY;
+        for (int t = 0; t < seq_len; ++t) {
+            double dot = 0.0;
+            for (int d = 0; d < head_dim; ++d) {
+                float q_val = __half2float(h_q[qh * head_dim + d]);
+                float k_val = __half2float(h_k_cache[t * head_dim + d]);
+                dot += static_cast<double>(q_val * k_val);
+            }
+            float sc = static_cast<float>(dot) * scale;
+            scores[t] = sc;
+            if (sc > m_max) m_max = sc;
+        }
+
+        double d_total = 0.0;
+        for (int t = 0; t < seq_len; ++t) {
+            d_total += std::exp(static_cast<double>(scores[t] - m_max));
+        }
+
+        for (int d = 0; d < head_dim; ++d) {
+            double acc = 0.0;
+            for (int t = 0; t < seq_len; ++t) {
+                double w = std::exp(static_cast<double>(scores[t] - m_max)) / d_total;
+                float v_val = __half2float(h_v_cache[t * head_dim + d]);
+                acc += w * static_cast<double>(v_val);
+            }
+            h_out_ref[qh * head_dim + d] = __float2half(static_cast<float>(acc));
+        }
+    }
+
+    half *d_q = nullptr, *d_kc = nullptr, *d_vc = nullptr, *d_attn_out = nullptr;
+    float *d_splitk_out = nullptr, *d_splitk_lse = nullptr;
+    DeviceControlBlock* d_dcb = nullptr;
+
+    CUDA_CHECK(cudaMalloc(&d_q, h_q.size() * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_kc, h_k_cache.size() * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_vc, h_v_cache.size() * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_attn_out, num_q_heads * head_dim * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_splitk_out, num_q_heads * FLASH_DECODE_SPLITS * head_dim * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_splitk_lse, num_q_heads * FLASH_DECODE_SPLITS * 2 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_dcb, sizeof(DeviceControlBlock)));
+
+    CUDA_CHECK(cudaMemcpy(d_q, h_q.data(), h_q.size() * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_kc, h_k_cache.data(), h_k_cache.size() * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_vc, h_v_cache.data(), h_v_cache.size() * sizeof(half), cudaMemcpyHostToDevice));
+
+    DeviceControlBlock dcb = { 0, seq_pos, 0.0f, 0, 1337ULL };
+    CUDA_CHECK(cudaMemcpy(d_dcb, &dcb, sizeof(DeviceControlBlock), cudaMemcpyHostToDevice));
+
+    launch_attention_gqa_flash_decode(
+        d_q, d_kc, d_vc, d_splitk_out, d_splitk_lse, d_attn_out, d_dcb,
+        nullptr, num_q_heads, num_kv_heads, head_dim, max_seq_len
+    );
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<half> h_gpu_out(num_q_heads * head_dim);
+    CUDA_CHECK(cudaMemcpy(h_gpu_out.data(), d_attn_out, h_gpu_out.size() * sizeof(half), cudaMemcpyDeviceToHost));
+
+    cudaFree(d_q); cudaFree(d_kc); cudaFree(d_vc);
+    cudaFree(d_attn_out); cudaFree(d_splitk_out); cudaFree(d_splitk_lse); cudaFree(d_dcb);
+
+    float max_err = compute_max_abs_err(h_gpu_out.data(), h_out_ref.data(), h_gpu_out.size());
+    float cos_sim = compute_cosine_similarity(h_gpu_out.data(), h_out_ref.data(), h_gpu_out.size());
+    bool has_nan = check_has_nan_or_inf(h_gpu_out.data(), h_gpu_out.size());
+
+    std::cout << "  - FlashDecode 256 Max Abs Error: " << max_err << " (threshold: <= 2e-3)" << std::endl;
+    std::cout << "  - FlashDecode 256 Cosine Similarity: " << cos_sim << " (threshold: >= 0.999)" << std::endl;
+
+    if (has_nan || max_err > 2e-3f || cos_sim < 0.999f) {
+        std::cerr << "  FAILED: FlashDecode 256 error exceeds threshold or has NaN/Inf!" << std::endl;
+        return false;
+    }
+    std::cout << "  [PASSED] Synthetic FlashDecoding at head_dim = 256 parity verified." << std::endl;
+    return true;
+}
+
+// [Synthetic Suite 7] Partial RoPE (rotary_dim = 64, head_dim = 256, rope_theta = 1,000,000.0f)
+bool run_synthetic_partial_rope_64_256_suite() {
+    std::cout << "\n[Synthetic Suite 7] Testing Partial RoPE (rotary_dim = 64, head_dim = 256)..." << std::endl;
+    constexpr int num_tokens = 1;
+    constexpr int num_q_heads = 4;
+    constexpr int num_kv_heads = 1;
+    constexpr int head_dim = 256;
+    constexpr int rotary_dim = 64;
+    constexpr int half_rotary = rotary_dim / 2; // 32
+    constexpr float rope_theta = 1000000.0f;
+    constexpr int pos = 7;
+    constexpr int max_seq_len = 64;
+
+    int q_dim = num_q_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+
+    std::vector<half> h_q(q_dim);
+    std::vector<half> h_k(kv_dim);
+    std::vector<half> h_v(kv_dim);
+    for (size_t i = 0; i < h_q.size(); ++i) h_q[i] = __float2half(dis(gen));
+    for (size_t i = 0; i < h_k.size(); ++i) h_k[i] = __float2half(dis(gen));
+    for (size_t i = 0; i < h_v.size(); ++i) h_v[i] = __float2half(dis(gen));
+
+    std::vector<half> h_q_orig = h_q;
+    std::vector<half> h_k_orig = h_k;
+    std::vector<half> h_q_ref = h_q;
+    std::vector<half> h_k_ref = h_k;
+
+    // CPU Partial RoPE: rotate dimensions [0, 64) across pairs (d, d+32)
+    for (int d = 0; d < half_rotary; ++d) {
+        float exponent = -2.0f * static_cast<float>(d) / static_cast<float>(rotary_dim);
+        float theta = std::pow(rope_theta, exponent);
+        float angle = static_cast<float>(pos) * theta;
+        float sin_v = std::sin(angle);
+        float cos_v = std::cos(angle);
+
+        for (int qh = 0; qh < num_q_heads; ++qh) {
+            float x0 = __half2float(h_q_orig[qh * head_dim + d]);
+            float x1 = __half2float(h_q_orig[qh * head_dim + d + half_rotary]);
+            h_q_ref[qh * head_dim + d] = __float2half(x0 * cos_v - x1 * sin_v);
+            h_q_ref[qh * head_dim + d + half_rotary] = __float2half(x0 * sin_v + x1 * cos_v);
+        }
+        for (int kh = 0; kh < num_kv_heads; ++kh) {
+            float x0 = __half2float(h_k_orig[kh * head_dim + d]);
+            float x1 = __half2float(h_k_orig[kh * head_dim + d + half_rotary]);
+            h_k_ref[kh * head_dim + d] = __float2half(x0 * cos_v - x1 * sin_v);
+            h_k_ref[kh * head_dim + d + half_rotary] = __float2half(x0 * sin_v + x1 * cos_v);
+        }
+    }
+
+    half *d_q = nullptr, *d_k = nullptr, *d_v = nullptr;
+    half *d_kc = nullptr, *d_vc = nullptr;
+    DeviceControlBlock* d_dcb = nullptr;
+
+    CUDA_CHECK(cudaMalloc(&d_q, q_dim * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_k, kv_dim * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_v, kv_dim * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_kc, num_kv_heads * max_seq_len * head_dim * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_vc, num_kv_heads * max_seq_len * head_dim * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_dcb, sizeof(DeviceControlBlock)));
+
+    CUDA_CHECK(cudaMemcpy(d_q, h_q.data(), q_dim * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_k, h_k.data(), kv_dim * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_v, h_v.data(), kv_dim * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_kc, 0, num_kv_heads * max_seq_len * head_dim * sizeof(half)));
+    CUDA_CHECK(cudaMemset(d_vc, 0, num_kv_heads * max_seq_len * head_dim * sizeof(half)));
+
+    DeviceControlBlock dcb = { 0, pos, 0.0f, 0, 1337ULL };
+    CUDA_CHECK(cudaMemcpy(d_dcb, &dcb, sizeof(DeviceControlBlock), cudaMemcpyHostToDevice));
+
+    launch_qkv_bias_rope_kv_append(
+        d_q, d_k, d_v, nullptr, nullptr, nullptr, d_kc, d_vc, d_dcb,
+        num_tokens, nullptr, num_q_heads, num_kv_heads, head_dim, max_seq_len,
+        rotary_dim, rope_theta
+    );
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<half> h_gpu_q(q_dim);
+    std::vector<half> h_gpu_k(kv_dim);
+    CUDA_CHECK(cudaMemcpy(h_gpu_q.data(), d_q, q_dim * sizeof(half), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_gpu_k.data(), d_k, kv_dim * sizeof(half), cudaMemcpyDeviceToHost));
+
+    cudaFree(d_q); cudaFree(d_k); cudaFree(d_v);
+    cudaFree(d_kc); cudaFree(d_vc); cudaFree(d_dcb);
+
+    // Verify rotated portion [0, 64)
+    float rot_err_q = 0.0f, rot_err_k = 0.0f;
+    for (int qh = 0; qh < num_q_heads; ++qh) {
+        for (int d = 0; d < rotary_dim; ++d) {
+            float diff = std::abs(__half2float(h_gpu_q[qh * head_dim + d]) - __half2float(h_q_ref[qh * head_dim + d]));
+            if (diff > rot_err_q) rot_err_q = diff;
+        }
+    }
+    for (int kh = 0; kh < num_kv_heads; ++kh) {
+        for (int d = 0; d < rotary_dim; ++d) {
+            float diff = std::abs(__half2float(h_gpu_k[kh * head_dim + d]) - __half2float(h_k_ref[kh * head_dim + d]));
+            if (diff > rot_err_k) rot_err_k = diff;
+        }
+    }
+
+    // Verify identity pass-through portion [64, 256) is bit-exact
+    float unrot_err_q = 0.0f, unrot_err_k = 0.0f;
+    for (int qh = 0; qh < num_q_heads; ++qh) {
+        for (int d = rotary_dim; d < head_dim; ++d) {
+            float diff = std::abs(__half2float(h_gpu_q[qh * head_dim + d]) - __half2float(h_q_orig[qh * head_dim + d]));
+            if (diff > unrot_err_q) unrot_err_q = diff;
+        }
+    }
+    for (int kh = 0; kh < num_kv_heads; ++kh) {
+        for (int d = rotary_dim; d < head_dim; ++d) {
+            float diff = std::abs(__half2float(h_gpu_k[kh * head_dim + d]) - __half2float(h_k_orig[kh * head_dim + d]));
+            if (diff > unrot_err_k) unrot_err_k = diff;
+        }
+    }
+
+    std::cout << "  - Partial RoPE [0, 64) Q Error: " << rot_err_q << " (threshold: <= 1e-4)" << std::endl;
+    std::cout << "  - Partial RoPE [0, 64) K Error: " << rot_err_k << " (threshold: <= 1e-4)" << std::endl;
+    std::cout << "  - Identity [64, 256) Q Error:   " << unrot_err_q << " (expected: 0.0)" << std::endl;
+    std::cout << "  - Identity [64, 256) K Error:   " << unrot_err_k << " (expected: 0.0)" << std::endl;
+
+    if (rot_err_q > 1e-4f || rot_err_k > 1e-4f || unrot_err_q != 0.0f || unrot_err_k != 0.0f) {
+        std::cerr << "  FAILED: Partial RoPE invariant violated!" << std::endl;
+        return false;
+    }
+    std::cout << "  [PASSED] Synthetic Partial RoPE (rotary_dim = 64, head_dim = 256) verified." << std::endl;
+    return true;
+}
+
+// [Synthetic Suite 8] AVX2 Host Vectorized Half Addition (5120 elements)
+bool run_synthetic_avx2_vector_add_half_suite() {
+    std::cout << "\n[Synthetic Suite 8] Testing Host AVX2 Vectorized Half Add (H=5120)..." << std::endl;
+    constexpr size_t count = 5120;
+
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dis(-2.0f, 2.0f);
+
+    std::vector<half> h_dst(count);
+    std::vector<half> h_src(count);
+    std::vector<half> h_ref(count);
+
+    for (size_t i = 0; i < count; ++i) {
+        h_dst[i] = __float2half(dis(gen));
+        h_src[i] = __float2half(dis(gen));
+        float s = __half2float(h_dst[i]) + __half2float(h_src[i]);
+        h_ref[i] = __float2half(s);
+    }
+
+    avx2_vector_add_half(h_dst.data(), h_src.data(), count);
+
+    float max_err = compute_max_abs_err(h_dst.data(), h_ref.data(), count);
+    float cos_sim = compute_cosine_similarity(h_dst.data(), h_ref.data(), count);
+
+    std::cout << "  - AVX2 Vector Add Max Abs Error: " << max_err << " (threshold: <= 1e-3)" << std::endl;
+    std::cout << "  - AVX2 Vector Add Cosine Similarity: " << cos_sim << " (threshold: >= 0.9999)" << std::endl;
+
+    if (max_err > 1e-3f || cos_sim < 0.9999f) {
+        std::cerr << "  FAILED: AVX2 Vector Add parity error exceeds threshold!" << std::endl;
+        return false;
+    }
+    std::cout << "  [PASSED] Host AVX2 Vectorized Half Add verified." << std::endl;
+    return true;
+}
+
 // ============================================================================
 // Golden Reference Parity Suite (Opt-In with --golden <path>)
 // ============================================================================
@@ -1256,6 +1527,9 @@ int main(int argc, char** argv) {
     if (!run_synthetic_gemv_swiglu_suite()) all_passed = false;
     if (!run_synthetic_deltanet_suite()) all_passed = false;
     if (!run_synthetic_conv1d_suite()) all_passed = false;
+    if (!run_synthetic_flash_decode_256_suite()) all_passed = false;
+    if (!run_synthetic_partial_rope_64_256_suite()) all_passed = false;
+    if (!run_synthetic_avx2_vector_add_half_suite()) all_passed = false;
 
     // Conditionally execute golden reference suite if requested
     if (run_golden) {

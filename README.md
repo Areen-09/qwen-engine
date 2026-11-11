@@ -25,11 +25,6 @@ Designed to run at maximum memory bandwidth with zero external math runtime libr
 
 For comprehensive architecture details, selective KV cache savings formulas, and memory layout proofs, see **[`docs/MODELS.md`](docs/MODELS.md)**. For the exact binary container format, see **[`docs/SPECIFICATION.md`](docs/SPECIFICATION.md)**.
 
-### Interactive Notebooks
-- **[Qwen 3.8-27B Dual Tesla T4 Kaggle Notebook](notebooks/qwen38_27b_dual_t4_kaggle.ipynb)**: Dedicated end-to-end notebook for running the 27B hybrid model on Kaggle's free 2x Tesla T4 GPUs with $TP=2$, real-time streaming, ChatML dialogue, and transactional rollback.
-- **[Unified Inference & Benchmarks Notebook](notebooks/qwen_inference_and_benchmarks.ipynb)**: Walkthrough across Qwen 2.5-1.5B, Qwen 3.5-4B Hybrid, and dual-GPU tensor parallelism.
-- **[Model Exporter & Quantizer Notebook](notebooks/convert_models_to_qwenbin.ipynb)**: Layer-streaming GGUF / SafeTensors converter and Hugging Face Hub exporter.
-
 ---
 
 ## Key Highlights
@@ -247,7 +242,6 @@ pytest tests/test_dynamic_engine.py tests/test_gguf_converter.py -v
 
 - 📖 **[Model Architecture & Deployment Guide (`docs/MODELS.md`)](docs/MODELS.md):** Architectural topologies, memory consumption formulas, selective KV cache savings (75%), and multi-GPU topologies ($TP=2$).
 - 📐 **[Technical Specification & Container Layout (`docs/SPECIFICATION.md`)](docs/SPECIFICATION.md):** `.qwenbin` v2 container specification, 216-byte `LayerDescriptor` binary format (`"<2I26Q"`), and dynamic memory arena offsets.
-- 🚀 **[Walkthrough Guide: Using qwen-engine (`docs/walkthrough_qwen_engine.md`)](docs/walkthrough_qwen_engine.md):** Advanced Python streaming, exception handling, custom tokenization, and architecture deep dives.
 
 ---
 

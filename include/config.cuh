@@ -41,6 +41,18 @@ constexpr int32_t TOKEN_PAD           = 151643;
 constexpr int32_t TOKEN_ENDOFTEXT     = 151643;
 constexpr int32_t TOKEN_IM_START      = 151644;
 constexpr int32_t TOKEN_IM_END        = 151645;
+constexpr int32_t TOKEN_ENDOFTEXT_QWEN38 = 248044;
+constexpr int32_t TOKEN_BOS_QWEN38       = 248044;
+
+// Architectural compile-time dimensions for Qwen3.8-27B
+constexpr int32_t QWEN38_NUM_LAYERS        = 64;
+constexpr int32_t QWEN38_HIDDEN_SIZE       = 5120;
+constexpr int32_t QWEN38_INTERMEDIATE_SIZE = 17408;
+constexpr int32_t QWEN38_NUM_Q_HEADS       = 32;
+constexpr int32_t QWEN38_NUM_KV_HEADS      = 4;
+constexpr int32_t QWEN38_HEAD_DIM          = 256;
+constexpr int32_t QWEN38_ROTARY_DIM        = 64;
+constexpr int32_t QWEN38_VOCAB_SIZE        = 248320;
 
 enum class QuantMode : uint32_t {
     FP16 = 0,

@@ -29,14 +29,19 @@ public:
     std::vector<int32_t> format_chatml(const std::vector<ChatMessage>& messages) const;
 
     static bool is_eos(int32_t token_id) {
-        return token_id == TOKEN_ENDOFTEXT || token_id == TOKEN_IM_END;
+        return token_id == TOKEN_ENDOFTEXT || token_id == TOKEN_IM_END || token_id == TOKEN_ENDOFTEXT_QWEN38;
     }
+
+    int32_t eos_id() const { return eos_id_; }
+    void set_eos_id(int32_t id) { eos_id_ = id; }
 
     int32_t vocab_size() const { return static_cast<int32_t>(vocab_pieces_.size()); }
 
 private:
     void load_tokenizer_bin(const std::string& path);
     void load_tokenizer_buffer(const void* buffer, size_t size);
+
+    int32_t eos_id_{TOKEN_IM_END};
 
     // BPE piece table
     std::vector<std::string> vocab_pieces_;
