@@ -189,6 +189,7 @@ void launch_deltanet_decode_sm75(
     deltanet_decode_sm75_kernel<<<grid, block, 0, stream>>>(
         q, k, v, beta, s_state, out, num_heads, head_dim
     );
+    CUDA_KERNEL_CHECK();
 }
 
 void launch_depthwise_conv1d_step(
@@ -206,6 +207,7 @@ void launch_depthwise_conv1d_step(
     depthwise_conv1d_step_kernel<<<grid, block, 0, stream>>>(
         in, weight, bias, conv_state, out, num_channels, kernel_size
     );
+    CUDA_KERNEL_CHECK();
 }
 
 void launch_deltanet_step(

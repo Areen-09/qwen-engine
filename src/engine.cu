@@ -553,7 +553,7 @@ void QwenEngine::execute_deltanet_decode_layer(int l) {
     );
 
     // 4. Out projection
-    if (quant_mode_ == QuantMode::FP16) {
+    if (quant_mode_ == QuantMode::FP16 || layers_[l].delta_out_scale == nullptr) {
         launch_gemv_fp16(reinterpret_cast<const half*>(layers_[l].delta_out_weight), ws_.d_attn_out, residual_ptr, output_ptr, h_dim, q_dim, stream_);
     } else {
         launch_gemv_w4a16(reinterpret_cast<const uint32_t*>(layers_[l].delta_out_weight), layers_[l].delta_out_scale, ws_.d_attn_out, residual_ptr, output_ptr, h_dim, q_dim, stream_);
@@ -566,7 +566,7 @@ void QwenEngine::execute_decode_pass() {
     int n_layers = model_config_.num_layers();
 
     // 1. Embedding lookup
-    if (quant_mode_ == QuantMode::FP16) {
+    if (quant_mode_ == QuantMode::FP16 || d_embed_scale_ == nullptr) {
         launch_embed_lookup_fp16(
             reinterpret_cast<const half*>(d_embed_weight_), nullptr, ws_.d_act_0, d_control_, 1, stream_, h_dim
         );
@@ -631,7 +631,7 @@ void QwenEngine::execute_decode_pass() {
     int vocab_size = model_config_.vocab_size();
     int rank_vocab = (device_ids_.size() > 1) ? (vocab_size / 2) : vocab_size;
 
-    if (quant_mode_ == QuantMode::FP16) {
+    if (quant_mode_ == QuantMode::FP16 || d_lm_head_scale_ == nullptr) {
         launch_rmsnorm_fp16(ws_.d_act_0, d_final_norm_, ws_.d_act_1, 1, stream_, h_dim);
         launch_gemv_fp16(reinterpret_cast<const half*>(d_lm_head_weight_), ws_.d_act_1, nullptr, ws_.d_logits, rank_vocab, h_dim, stream_);
     } else {
@@ -780,7 +780,7 @@ void QwenEngine::execute_deltanet_prefill_layer(int l, int chunk_start, int chun
 
         launch_depthwise_conv1d_step(tok_act, layers_[l].conv1d_weight, layers_[l].conv1d_bias, layer_conv_state, ws_.d_q, q_dim, 4, stream_);
         launch_deltanet_decode_sm75(ws_.d_q, ws_.d_q, ws_.d_q, layers_[l].decay_weight, layer_s_state, ws_.d_attn_out, 1, num_heads, head_dim, stream_);
-        if (quant_mode_ == QuantMode::FP16) {
+        if (quant_mode_ == QuantMode::FP16 || layers_[l].delta_out_scale == nullptr) {
             launch_gemv_fp16(reinterpret_cast<const half*>(layers_[l].delta_out_weight), ws_.d_attn_out, (device_ids_.size() > 1 ? nullptr : tok_res), tok_out, h_dim, q_dim, stream_);
         } else {
             launch_gemv_w4a16(reinterpret_cast<const uint32_t*>(layers_[l].delta_out_weight), layers_[l].delta_out_scale, ws_.d_attn_out, (device_ids_.size() > 1 ? nullptr : tok_res), tok_out, h_dim, q_dim, stream_);
@@ -800,7 +800,7 @@ void QwenEngine::execute_prefill_chunk(int chunk_start, int chunk_len) {
     int i_dim = model_config_.intermediate_size();
     int n_layers = model_config_.num_layers();
 
-    if (quant_mode_ == QuantMode::FP16) {
+    if (quant_mode_ == QuantMode::FP16 || d_embed_scale_ == nullptr) {
         launch_embed_lookup_fp16(
             reinterpret_cast<const half*>(d_embed_weight_), ws_.d_prompt_tokens + chunk_start, ws_.d_act_0, nullptr, chunk_len, stream_, h_dim
         );
@@ -906,7 +906,7 @@ int32_t QwenEngine::prefill(const std::vector<int32_t>& prompt_tokens, float tem
 
     if (device_ids_.size() > 1) {
         int rank_vocab = model_config_.vocab_size() / 2;
-        if (quant_mode_ == QuantMode::FP16) {
+        if (quant_mode_ == QuantMode::FP16 || d_lm_head_scale_ == nullptr) {
             launch_rmsnorm_fp16(d_last_hidden, d_final_norm_, ws_.d_act_1, 1, stream_, h_dim);
             launch_gemv_fp16(reinterpret_cast<const half*>(d_lm_head_weight_), ws_.d_act_1, nullptr, ws_.d_logits, rank_vocab, h_dim, stream_);
         } else {
@@ -933,7 +933,7 @@ int32_t QwenEngine::prefill(const std::vector<int32_t>& prompt_tokens, float tem
             CudaDeviceGuard guard1(rank1_.device_id);
             CUDA_CHECK(cudaMemcpyAsync(&(rank1_.d_control->seq_pos), &last_pos, sizeof(int32_t), cudaMemcpyHostToDevice, rank1_.stream));
             half* d_last_hidden1 = rank1_.ws.d_act_0 + static_cast<size_t>((total_tokens - 1) % PREFILL_MAX_CHUNK) * h_dim;
-            if (rank1_.quant_mode == QuantMode::FP16) {
+            if (rank1_.quant_mode == QuantMode::FP16 || rank1_.d_lm_head_scale == nullptr) {
                 launch_rmsnorm_fp16(d_last_hidden1, rank1_.d_final_norm, rank1_.ws.d_act_1, 1, rank1_.stream, h_dim);
                 launch_gemv_fp16(reinterpret_cast<const half*>(rank1_.d_lm_head_weight), rank1_.ws.d_act_1, nullptr, rank1_.ws.d_logits, rank_vocab, h_dim, rank1_.stream);
             } else {
@@ -986,7 +986,7 @@ int32_t QwenEngine::prefill(const std::vector<int32_t>& prompt_tokens, float tem
         return last_token_id_;
     }
 
-    if (quant_mode_ == QuantMode::FP16) {
+    if (quant_mode_ == QuantMode::FP16 || d_lm_head_scale_ == nullptr) {
         launch_rmsnorm_fp16(d_last_hidden, d_final_norm_, ws_.d_act_1, 1, stream_, h_dim);
         launch_gemv_fp16(reinterpret_cast<const half*>(d_lm_head_weight_), ws_.d_act_1, nullptr, ws_.d_logits, model_config_.vocab_size(), h_dim, stream_);
     } else {
@@ -1526,7 +1526,7 @@ void QwenEngine::execute_rank1_deltanet_decode_layer(int l) {
     );
 
     // 4. Out projection
-    if (rank1_.quant_mode == QuantMode::FP16) {
+    if (rank1_.quant_mode == QuantMode::FP16 || rank1_.layers[l].delta_out_scale == nullptr) {
         launch_gemv_fp16(reinterpret_cast<const half*>(rank1_.layers[l].delta_out_weight), rank1_.ws.d_attn_out, residual_ptr, output_ptr, h_dim, q_dim, rank1_.stream);
     } else {
         launch_gemv_w4a16(reinterpret_cast<const uint32_t*>(rank1_.layers[l].delta_out_weight), rank1_.layers[l].delta_out_scale, rank1_.ws.d_attn_out, residual_ptr, output_ptr, h_dim, q_dim, rank1_.stream);
@@ -1540,7 +1540,7 @@ void QwenEngine::execute_rank1_decode_pass() {
     int n_layers = rank1_.model_config.num_layers();
 
     // 1. Embedding lookup
-    if (rank1_.quant_mode == QuantMode::FP16) {
+    if (rank1_.quant_mode == QuantMode::FP16 || rank1_.d_embed_scale == nullptr) {
         launch_embed_lookup_fp16(
             reinterpret_cast<const half*>(rank1_.d_embed_weight), nullptr, rank1_.ws.d_act_0, rank1_.d_control, 1, rank1_.stream, h_dim
         );
@@ -1603,7 +1603,7 @@ void QwenEngine::execute_rank1_decode_pass() {
 
     // 3. Final RMSNorm + LM Head
     int rank_vocab = rank1_.model_config.vocab_size() / 2;
-    if (rank1_.quant_mode == QuantMode::FP16) {
+    if (rank1_.quant_mode == QuantMode::FP16 || rank1_.d_lm_head_scale == nullptr) {
         launch_rmsnorm_fp16(rank1_.ws.d_act_0, rank1_.d_final_norm, rank1_.ws.d_act_1, 1, rank1_.stream, h_dim);
         launch_gemv_fp16(reinterpret_cast<const half*>(rank1_.d_lm_head_weight), rank1_.ws.d_act_1, nullptr, rank1_.ws.d_logits, rank_vocab, h_dim, rank1_.stream);
     } else {
@@ -1714,7 +1714,7 @@ void QwenEngine::execute_rank1_deltanet_prefill_layer(int l, int chunk_start, in
 
         launch_depthwise_conv1d_step(tok_act, rank1_.layers[l].conv1d_weight, rank1_.layers[l].conv1d_bias, layer_conv_state, rank1_.ws.d_q, q_dim, 4, rank1_.stream);
         launch_deltanet_decode_sm75(rank1_.ws.d_q, rank1_.ws.d_q, rank1_.ws.d_q, rank1_.layers[l].decay_weight, layer_s_state, rank1_.ws.d_attn_out, 1, num_heads, head_dim, rank1_.stream);
-        if (rank1_.quant_mode == QuantMode::FP16) {
+        if (rank1_.quant_mode == QuantMode::FP16 || rank1_.layers[l].delta_out_scale == nullptr) {
             launch_gemv_fp16(reinterpret_cast<const half*>(rank1_.layers[l].delta_out_weight), rank1_.ws.d_attn_out, nullptr, tok_out, h_dim, q_dim, rank1_.stream);
         } else {
             launch_gemv_w4a16(reinterpret_cast<const uint32_t*>(rank1_.layers[l].delta_out_weight), rank1_.layers[l].delta_out_scale, rank1_.ws.d_attn_out, nullptr, tok_out, h_dim, q_dim, rank1_.stream);
@@ -1733,7 +1733,7 @@ void QwenEngine::execute_rank1_prefill_chunk(int chunk_start, int chunk_len) {
     int i_dim = rank1_.model_config.intermediate_size();
     int n_layers = rank1_.model_config.num_layers();
 
-    if (rank1_.quant_mode == QuantMode::FP16) {
+    if (rank1_.quant_mode == QuantMode::FP16 || rank1_.d_embed_scale == nullptr) {
         launch_embed_lookup_fp16(
             reinterpret_cast<const half*>(rank1_.d_embed_weight), rank1_.ws.d_prompt_tokens + chunk_start, rank1_.ws.d_act_0, nullptr, chunk_len, rank1_.stream, h_dim
         );

@@ -23,7 +23,7 @@ __global__ void gemv_w4a8_kernel(
     int out_features,
     int in_features
 ) {
-    extern __shared__ uint8_t s_mem[];
+    extern __shared__ alignas(16) uint8_t s_mem[];
     int8_t* s_x_q8 = reinterpret_cast<int8_t*>(s_mem);
     int32_t* s_x_sum8 = reinterpret_cast<int32_t*>(s_mem + in_features);
     float* s_x_scale = reinterpret_cast<float*>(s_mem + in_features + (in_features / 8) * sizeof(int32_t));
@@ -148,7 +148,7 @@ __global__ void gemv_qkv_w4a8_kernel(
     int num_groups = in_features / QUANT_GROUP_SIZE;
     int num_warp_steps = in_features / 256;
 
-    extern __shared__ uint8_t s_mem[];
+    extern __shared__ alignas(16) uint8_t s_mem[];
     int8_t* s_x_q8 = reinterpret_cast<int8_t*>(s_mem);
     int32_t* s_x_sum8 = reinterpret_cast<int32_t*>(s_mem + in_features);
     float* s_x_scale = reinterpret_cast<float*>(s_mem + in_features + (in_features / 8) * sizeof(int32_t));
@@ -280,7 +280,7 @@ __global__ void gemv_dual_gate_up_swiglu_w4a8_kernel(
     int num_groups = in_features / QUANT_GROUP_SIZE;
     int num_warp_steps = in_features / 256;
 
-    extern __shared__ uint8_t s_mem[];
+    extern __shared__ alignas(16) uint8_t s_mem[];
     int8_t* s_x_q8 = reinterpret_cast<int8_t*>(s_mem);
     int32_t* s_x_sum8 = reinterpret_cast<int32_t*>(s_mem + in_features);
     float* s_x_scale = reinterpret_cast<float*>(s_mem + in_features + (in_features / 8) * sizeof(int32_t));
@@ -393,7 +393,7 @@ __global__ void gemv_w4a16_standalone_kernel(
     int out_features,
     int in_features
 ) {
-    extern __shared__ uint8_t s_mem[];
+    extern __shared__ alignas(16) uint8_t s_mem[];
     int8_t* s_x_q8 = reinterpret_cast<int8_t*>(s_mem);
     int32_t* s_x_sum8 = reinterpret_cast<int32_t*>(s_mem + in_features);
     float* s_x_scale = reinterpret_cast<float*>(s_mem + in_features + (in_features / 8) * sizeof(int32_t));
@@ -511,7 +511,7 @@ __global__ void gemv_dual_gate_up_swiglu_w4a16_standalone_kernel(
     int num_groups = in_features / QUANT_GROUP_SIZE;
     int num_warp_steps = in_features / 256;
 
-    extern __shared__ uint8_t s_mem[];
+    extern __shared__ alignas(16) uint8_t s_mem[];
     int8_t* s_x_q8 = reinterpret_cast<int8_t*>(s_mem);
     int32_t* s_x_sum8 = reinterpret_cast<int32_t*>(s_mem + in_features);
     float* s_x_scale = reinterpret_cast<float*>(s_mem + in_features + (in_features / 8) * sizeof(int32_t));
