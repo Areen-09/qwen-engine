@@ -53,7 +53,7 @@ class Engine:
             device_id: Target CUDA device ID (default: 0).
             device_ids: Optional list of target CUDA device IDs for multi-GPU execution.
         """
-        model_p = Path(model_path).resolve()
+        model_p = Path(model_path).absolute()
         if not model_p.is_file():
             raise ModelNotFoundError(f"Model file not found: {model_p}")
 
@@ -61,17 +61,17 @@ class Engine:
             # Check adjacent
             cand = model_p.parent / "tokenizer.bin"
             if cand.is_file():
-                tokenizer_p = cand
+                tokenizer_p = cand.absolute()
             else:
                 cwd_cand = Path("models") / "tokenizer.bin"
                 if cwd_cand.is_file():
-                    tokenizer_p = cwd_cand.resolve()
+                    tokenizer_p = cwd_cand.absolute()
                 else:
                     raise ModelNotFoundError(
                         f"tokenizer_path was not specified and could not be found adjacent to {model_p}"
                     )
         else:
-            tokenizer_p = Path(tokenizer_path).resolve()
+            tokenizer_p = Path(tokenizer_path).absolute()
             if not tokenizer_p.is_file():
                 raise ModelNotFoundError(f"Tokenizer file not found: {tokenizer_p}")
 
