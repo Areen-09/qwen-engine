@@ -335,6 +335,7 @@ void QwenEngine::setup_arena() {
             layers_[l].in_proj_weight   = get_d_ptr(desc.in_proj_weight_offset);
             layers_[l].decay_weight     = reinterpret_cast<const half*>(get_d_ptr(desc.decay_weight_offset));
             layers_[l].delta_out_weight = get_d_ptr(desc.delta_out_weight_offset);
+            layers_[l].delta_out_scale  = reinterpret_cast<const half*>(get_d_ptr(desc.attn_out_scale_offset));
         }
 
         layers_[l].gate_up_weight = get_d_ptr(desc.mlp_gate_offset);
@@ -552,7 +553,11 @@ void QwenEngine::execute_deltanet_decode_layer(int l) {
     );
 
     // 4. Out projection
-    launch_gemv_fp16(reinterpret_cast<const half*>(layers_[l].delta_out_weight), ws_.d_attn_out, residual_ptr, output_ptr, h_dim, q_dim, stream_);
+    if (quant_mode_ == QuantMode::FP16) {
+        launch_gemv_fp16(reinterpret_cast<const half*>(layers_[l].delta_out_weight), ws_.d_attn_out, residual_ptr, output_ptr, h_dim, q_dim, stream_);
+    } else {
+        launch_gemv_w4a16(reinterpret_cast<const uint32_t*>(layers_[l].delta_out_weight), layers_[l].delta_out_scale, ws_.d_attn_out, residual_ptr, output_ptr, h_dim, q_dim, stream_);
+    }
 }
 
 void QwenEngine::execute_decode_pass() {
@@ -775,7 +780,11 @@ void QwenEngine::execute_deltanet_prefill_layer(int l, int chunk_start, int chun
 
         launch_depthwise_conv1d_step(tok_act, layers_[l].conv1d_weight, layers_[l].conv1d_bias, layer_conv_state, ws_.d_q, q_dim, 4, stream_);
         launch_deltanet_decode_sm75(ws_.d_q, ws_.d_q, ws_.d_q, layers_[l].decay_weight, layer_s_state, ws_.d_attn_out, 1, num_heads, head_dim, stream_);
-        launch_gemv_fp16(reinterpret_cast<const half*>(layers_[l].delta_out_weight), ws_.d_attn_out, (device_ids_.size() > 1 ? nullptr : tok_res), tok_out, h_dim, q_dim, stream_);
+        if (quant_mode_ == QuantMode::FP16) {
+            launch_gemv_fp16(reinterpret_cast<const half*>(layers_[l].delta_out_weight), ws_.d_attn_out, (device_ids_.size() > 1 ? nullptr : tok_res), tok_out, h_dim, q_dim, stream_);
+        } else {
+            launch_gemv_w4a16(reinterpret_cast<const uint32_t*>(layers_[l].delta_out_weight), layers_[l].delta_out_scale, ws_.d_attn_out, (device_ids_.size() > 1 ? nullptr : tok_res), tok_out, h_dim, q_dim, stream_);
+        }
     }
 
     if (device_ids_.size() > 1) {
@@ -1247,6 +1256,7 @@ void QwenEngine::init_rank1() {
             rank1_.layers[l].in_proj_weight   = get_d_ptr(desc.in_proj_weight_offset);
             rank1_.layers[l].decay_weight     = reinterpret_cast<const half*>(get_d_ptr(desc.decay_weight_offset));
             rank1_.layers[l].delta_out_weight = get_d_ptr(desc.delta_out_weight_offset);
+            rank1_.layers[l].delta_out_scale  = reinterpret_cast<const half*>(get_d_ptr(desc.attn_out_scale_offset));
         }
 
         rank1_.layers[l].gate_up_weight = get_d_ptr(desc.mlp_gate_offset);
@@ -1516,7 +1526,11 @@ void QwenEngine::execute_rank1_deltanet_decode_layer(int l) {
     );
 
     // 4. Out projection
-    launch_gemv_fp16(reinterpret_cast<const half*>(rank1_.layers[l].delta_out_weight), rank1_.ws.d_attn_out, residual_ptr, output_ptr, h_dim, q_dim, rank1_.stream);
+    if (rank1_.quant_mode == QuantMode::FP16) {
+        launch_gemv_fp16(reinterpret_cast<const half*>(rank1_.layers[l].delta_out_weight), rank1_.ws.d_attn_out, residual_ptr, output_ptr, h_dim, q_dim, rank1_.stream);
+    } else {
+        launch_gemv_w4a16(reinterpret_cast<const uint32_t*>(rank1_.layers[l].delta_out_weight), rank1_.layers[l].delta_out_scale, rank1_.ws.d_attn_out, residual_ptr, output_ptr, h_dim, q_dim, rank1_.stream);
+    }
 }
 
 void QwenEngine::execute_rank1_decode_pass() {
@@ -1700,7 +1714,11 @@ void QwenEngine::execute_rank1_deltanet_prefill_layer(int l, int chunk_start, in
 
         launch_depthwise_conv1d_step(tok_act, rank1_.layers[l].conv1d_weight, rank1_.layers[l].conv1d_bias, layer_conv_state, rank1_.ws.d_q, q_dim, 4, rank1_.stream);
         launch_deltanet_decode_sm75(rank1_.ws.d_q, rank1_.ws.d_q, rank1_.ws.d_q, rank1_.layers[l].decay_weight, layer_s_state, rank1_.ws.d_attn_out, 1, num_heads, head_dim, rank1_.stream);
-        launch_gemv_fp16(reinterpret_cast<const half*>(rank1_.layers[l].delta_out_weight), rank1_.ws.d_attn_out, nullptr, tok_out, h_dim, q_dim, rank1_.stream);
+        if (rank1_.quant_mode == QuantMode::FP16) {
+            launch_gemv_fp16(reinterpret_cast<const half*>(rank1_.layers[l].delta_out_weight), rank1_.ws.d_attn_out, nullptr, tok_out, h_dim, q_dim, rank1_.stream);
+        } else {
+            launch_gemv_w4a16(reinterpret_cast<const uint32_t*>(rank1_.layers[l].delta_out_weight), rank1_.layers[l].delta_out_scale, rank1_.ws.d_attn_out, nullptr, tok_out, h_dim, q_dim, rank1_.stream);
+        }
     }
 
     rank1_.comm->all_reduce_sum(rank1_.ws.d_act_1, static_cast<size_t>(chunk_len) * h_dim, DataType::FP16, rank1_.stream);

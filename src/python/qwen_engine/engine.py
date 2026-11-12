@@ -372,7 +372,11 @@ class Engine:
                 native_stream.close(rollback=should_rollback)
             else:
                 if not normal_completion and rollback_on_interrupt and prompt_len > 0:
-                    self._engine.rollback_to(prompt_len)
+                    try:
+                        if self._engine.seq_pos() >= prompt_len:
+                            self._engine.rollback_to(prompt_len)
+                    except Exception:
+                        pass
                 self._engine.release_session()
 
     async def stream_async(
