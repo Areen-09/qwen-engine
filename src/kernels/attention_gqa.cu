@@ -337,10 +337,11 @@ __global__ void attention_gqa_flash_decode_stage2_kernel(
 
 // ----------------------------------------------------------------------------
 // Causal Prefill Attention Kernel (Zero inner-loop barriers, 6 Q heads shared)
-// Grid: (NUM_KV_HEADS = 2, num_tokens)
+// Grid: (NUM_KV_HEADS, num_tokens)
 // Threads: 128 (4 warps)
 // ----------------------------------------------------------------------------
 
+template <int HEAD_D>
 __global__ void attention_gqa_prefill_kernel(
     const half* __restrict__ q,
     const half* __restrict__ layer_k_cache,
@@ -358,10 +359,12 @@ __global__ void attention_gqa_prefill_kernel(
     int m    = blockIdx.y;
     if (m >= num_tokens) return;
 
+    constexpr int ELEMS_PER_LANE = (HEAD_D == 256) ? 8 : 4;
+
     int tid = threadIdx.x;
     int warp_id = tid / 32;
     int lane_id = tid % 32;
-    int d_base  = lane_id * 4;
+    int d_base  = lane_id * ELEMS_PER_LANE;
 
     int gqa_group_size = num_q_heads / num_kv_heads;
     int q_dim = num_q_heads * head_dim;
@@ -375,68 +378,88 @@ __global__ void attention_gqa_prefill_kernel(
     int seq_len = cur_pos + 1;
 
     // Load Query vectors into registers
-    float q_reg[MAX_GQA_GROUP][4];
+    float q_reg[MAX_GQA_GROUP][ELEMS_PER_LANE];
     for (int h = 0; h < gqa_group_size; ++h) {
         size_t q_idx = static_cast<size_t>(m) * q_dim + (q_head_base + h) * head_dim + d_base;
-        uint2 raw_u2 = *reinterpret_cast<const uint2*>(q + q_idx);
-        const half* raw_h = reinterpret_cast<const half*>(&raw_u2);
-        #pragma unroll
-        for (int p = 0; p < 4; ++p) {
-            q_reg[h][p] = __half2float(raw_h[p]);
+        if constexpr (HEAD_D == 256) {
+            uint4 raw_u4 = *reinterpret_cast<const uint4*>(q + q_idx);
+            const half* raw_h = reinterpret_cast<const half*>(&raw_u4);
+            #pragma unroll
+            for (int p = 0; p < 8; ++p) {
+                q_reg[h][p] = __half2float(raw_h[p]);
+            }
+        } else {
+            uint2 raw_u2 = *reinterpret_cast<const uint2*>(q + q_idx);
+            const half* raw_h = reinterpret_cast<const half*>(&raw_u2);
+            #pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                q_reg[h][p] = __half2float(raw_h[p]);
+            }
         }
     }
 
     float m_i[MAX_GQA_GROUP];
     float d_i[MAX_GQA_GROUP];
-    float o_reg[MAX_GQA_GROUP][4];
+    float o_reg[MAX_GQA_GROUP][ELEMS_PER_LANE];
 
     for (int h = 0; h < gqa_group_size; ++h) {
         m_i[h] = -INFINITY;
         d_i[h] = 0.0f;
         #pragma unroll
-        for (int p = 0; p < 4; ++p) {
+        for (int p = 0; p < ELEMS_PER_LANE; ++p) {
             o_reg[h][p] = 0.0f;
         }
     }
 
-    constexpr float SCALE = 0.08838834764831845f;
+    const float scale = 1.0f / sqrtf(static_cast<float>(HEAD_D));
 
     // Sweeping cached tokens: 4 warps stride by 4 with ZERO __syncthreads() barriers
     for (int t = warp_id; t < seq_len; t += 4) {
         size_t cache_base = (static_cast<size_t>(kv_h) * max_seq_len + t) * head_dim + d_base;
 
-        uint2 k_u2 = *reinterpret_cast<const uint2*>(layer_k_cache + cache_base);
-        uint2 v_u2 = *reinterpret_cast<const uint2*>(layer_v_cache + cache_base);
-
-        const half* k_h = reinterpret_cast<const half*>(&k_u2);
-        const half* v_h = reinterpret_cast<const half*>(&v_u2);
-
-        float k_val[4], v_val[4];
-        #pragma unroll
-        for (int p = 0; p < 4; ++p) {
-            k_val[p] = __half2float(k_h[p]);
-            v_val[p] = __half2float(v_h[p]);
+        float k_val[ELEMS_PER_LANE], v_val[ELEMS_PER_LANE];
+        if constexpr (HEAD_D == 256) {
+            uint4 k_u4 = *reinterpret_cast<const uint4*>(layer_k_cache + cache_base);
+            uint4 v_u4 = *reinterpret_cast<const uint4*>(layer_v_cache + cache_base);
+            const half* k_h = reinterpret_cast<const half*>(&k_u4);
+            const half* v_h = reinterpret_cast<const half*>(&v_u4);
+            #pragma unroll
+            for (int p = 0; p < 8; ++p) {
+                k_val[p] = __half2float(k_h[p]);
+                v_val[p] = __half2float(v_h[p]);
+            }
+        } else {
+            uint2 k_u2 = *reinterpret_cast<const uint2*>(layer_k_cache + cache_base);
+            uint2 v_u2 = *reinterpret_cast<const uint2*>(layer_v_cache + cache_base);
+            const half* k_h = reinterpret_cast<const half*>(&k_u2);
+            const half* v_h = reinterpret_cast<const half*>(&v_u2);
+            #pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                k_val[p] = __half2float(k_h[p]);
+                v_val[p] = __half2float(v_h[p]);
+            }
         }
 
         for (int h = 0; h < gqa_group_size; ++h) {
-            float prod = q_reg[h][0] * k_val[0] +
-                         q_reg[h][1] * k_val[1] +
-                         q_reg[h][2] * k_val[2] +
-                         q_reg[h][3] * k_val[3];
+            float prod = 0.0f;
+            #pragma unroll
+            for (int p = 0; p < ELEMS_PER_LANE; ++p) {
+                prod += q_reg[h][p] * k_val[p];
+            }
 
             #pragma unroll
             for (int mask = 16; mask > 0; mask >>= 1) {
                 prod += __shfl_xor_sync(0xFFFFFFFF, prod, mask);
             }
 
-            float score = prod * SCALE;
+            float score = prod * scale;
             float m_curr = fmaxf(m_i[h], score);
             float alpha = expf(m_i[h] - m_curr);
             float beta  = expf(score - m_curr);
 
             d_i[h] = d_i[h] * alpha + beta;
             #pragma unroll
-            for (int p = 0; p < 4; ++p) {
+            for (int p = 0; p < ELEMS_PER_LANE; ++p) {
                 o_reg[h][p] = o_reg[h][p] * alpha + beta * v_val[p];
             }
             m_i[h] = m_curr;
@@ -446,7 +469,7 @@ __global__ void attention_gqa_prefill_kernel(
     // Shared memory cross-warp reduction
     __shared__ float s_m[MAX_GQA_GROUP][4];
     __shared__ float s_d[MAX_GQA_GROUP][4];
-    __shared__ float s_o[4][HEAD_DIM];
+    __shared__ float s_o[4][HEAD_D];
 
     if (lane_id < gqa_group_size) {
         s_m[lane_id][warp_id] = m_i[lane_id];
@@ -456,7 +479,7 @@ __global__ void attention_gqa_prefill_kernel(
 
     for (int h = 0; h < gqa_group_size; ++h) {
         #pragma unroll
-        for (int p = 0; p < 4; ++p) {
+        for (int p = 0; p < ELEMS_PER_LANE; ++p) {
             s_o[warp_id][d_base + p] = o_reg[h][p];
         }
         __syncthreads();
@@ -553,10 +576,17 @@ void launch_attention_gqa_prefill(
     int hidden_size
 ) {
     dim3 grid(num_kv_heads, num_tokens);
-    attention_gqa_prefill_kernel<<<grid, 128, 0, stream>>>(
-        q, layer_k_cache, layer_v_cache, attn_out, d_control, num_tokens,
-        num_q_heads, num_kv_heads, head_dim, max_seq_len, hidden_size
-    );
+    if (head_dim == 256) {
+        attention_gqa_prefill_kernel<256><<<grid, 128, 0, stream>>>(
+            q, layer_k_cache, layer_v_cache, attn_out, d_control, num_tokens,
+            num_q_heads, num_kv_heads, head_dim, max_seq_len, hidden_size
+        );
+    } else {
+        attention_gqa_prefill_kernel<128><<<grid, 128, 0, stream>>>(
+            q, layer_k_cache, layer_v_cache, attn_out, d_control, num_tokens,
+            num_q_heads, num_kv_heads, head_dim, max_seq_len, hidden_size
+        );
+    }
     CUDA_KERNEL_CHECK();
 }
 
