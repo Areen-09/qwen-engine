@@ -172,8 +172,8 @@ struct EngineConfig {
 class QwenEngine {
 public:
     explicit QwenEngine(const EngineConfig& config);
-    explicit QwenEngine(const std::string& qwenbin_path, int device_id = 0);
-    explicit QwenEngine(const std::string& qwenbin_path, const std::vector<int>& device_ids);
+    explicit QwenEngine(const std::string& qwenbin_path, int device_id = 0, size_t max_seq_len = 4096);
+    explicit QwenEngine(const std::string& qwenbin_path, const std::vector<int>& device_ids, size_t max_seq_len = 4096);
     ~QwenEngine();
 
     QwenEngine(const QwenEngine&) = delete;

@@ -114,11 +114,11 @@ QwenEngine::QwenEngine(const EngineConfig& config)
     capture_decode_graph();
 }
 
-QwenEngine::QwenEngine(const std::string& qwenbin_path, int device_id)
-    : QwenEngine(EngineConfig{qwenbin_path, "", {device_id}, 4096, false}) {}
+QwenEngine::QwenEngine(const std::string& qwenbin_path, int device_id, size_t max_seq_len)
+    : QwenEngine(EngineConfig{qwenbin_path, "", {device_id}, max_seq_len, false}) {}
 
-QwenEngine::QwenEngine(const std::string& qwenbin_path, const std::vector<int>& device_ids)
-    : QwenEngine(EngineConfig{qwenbin_path, "", device_ids, 4096, false}) {}
+QwenEngine::QwenEngine(const std::string& qwenbin_path, const std::vector<int>& device_ids, size_t max_seq_len)
+    : QwenEngine(EngineConfig{qwenbin_path, "", device_ids, max_seq_len, false}) {}
 
 QwenEngine::~QwenEngine() {
     if (worker_thread_.joinable()) {
@@ -176,7 +176,13 @@ void QwenEngine::load_model_file(const std::string& qwenbin_path) {
         const LayerDescriptor* layers = reinterpret_cast<const LayerDescriptor*>(mapped_data_ + h2->layer_table_offset);
         model_config_ = ModelConfig(*h2, layers);
         quant_mode_ = static_cast<QuantMode>(h2->quant_type);
-        max_seq_len_ = h2->max_seq_len;
+        // Retain user-configured max_seq_len_ (default 4096), capping at container max_seq_len if smaller.
+        // Prevents allocating excessive KV cache when GGUF specifies a 256k theoretical context window.
+        if (max_seq_len_ == 0 || max_seq_len_ > 32768) {
+            max_seq_len_ = (h2->max_seq_len > 0 && h2->max_seq_len <= 8192) ? h2->max_seq_len : 4096;
+        } else if (h2->max_seq_len > 0 && max_seq_len_ > h2->max_seq_len) {
+            max_seq_len_ = h2->max_seq_len;
+        }
     } else if (version == 1) {
         const QWQwenHeader* h1 = reinterpret_cast<const QWQwenHeader*>(mapped_data_);
         QwenBinHeaderV2 synth_h2{};

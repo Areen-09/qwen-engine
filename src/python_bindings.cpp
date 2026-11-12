@@ -199,8 +199,8 @@ NB_MODULE(_core, m) {
 
     // NativeEngine
     nb::class_<qwen::QwenEngine>(m, "NativeEngine")
-        .def(nb::init<const std::string&, int>(), "qwenbin_path"_a, "device_id"_a = 0)
-        .def(nb::init<const std::string&, const std::vector<int>&>(), "model_path"_a, "device_ids"_a)
+        .def(nb::init<const std::string&, int, size_t>(), "qwenbin_path"_a, "device_id"_a = 0, "max_seq_len"_a = 4096)
+        .def(nb::init<const std::string&, const std::vector<int>&, size_t>(), "model_path"_a, "device_ids"_a, "max_seq_len"_a = 4096)
         .def("prefill", [](qwen::QwenEngine& self, const std::vector<int32_t>& tokens, float temp) {
             nb::gil_scoped_release release;
             return self.prefill(tokens, temp);
