@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 
-RELEASE_TAG = "v0.2.1"
+RELEASE_TAG = "v0.2.2"
 WHEEL_VER = "0.2.0"
 GGUF_REPO = "Qwen/Qwen2.5-1.5B-Instruct-GGUF"
 GGUF_FILE = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
