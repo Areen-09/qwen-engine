@@ -49,11 +49,14 @@ def ensure_packages() -> None:
 
 
 def load_qwen_engine():
+    from huggingface_hub import hf_hub_download
     from qwen_engine import Engine
 
     if Path("models/qwen25_1.5b_w4a16.qwenbin").is_file():
         return Engine("models/qwen25_1.5b_w4a16.qwenbin", "models/tokenizer.bin", device_id=0)
-    return Engine.from_pretrained("qwen2.5-1.5b-w4a16", device_id=0)
+    model_path = hf_hub_download(repo_id="areen09/qwen-engine-models-qwenbin", filename="qwen2.5-1.5b-w4a16.qwenbin")
+    tok_path = hf_hub_download(repo_id="areen09/qwen-engine-models-qwenbin", filename="tokenizer.bin")
+    return Engine(model_path, tok_path, device_id=0)
 
 
 def resolve_gguf_path() -> str:

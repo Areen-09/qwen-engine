@@ -125,7 +125,8 @@ void launch_gemm_prefill_w4a16(
     int M,
     int N,
     int K,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int sm_count = 0
 );
 
 void launch_gemm_prefill_qkv_w4a16(
@@ -136,7 +137,8 @@ void launch_gemm_prefill_qkv_w4a16(
     int in_features = HIDDEN_SIZE,
     int num_q_heads = NUM_Q_HEADS,
     int num_kv_heads = NUM_KV_HEADS,
-    int head_dim = HEAD_DIM
+    int head_dim = HEAD_DIM,
+    int sm_count = 0
 );
 
 void launch_gemm_prefill_dual_gate_up_swiglu_w4a16(

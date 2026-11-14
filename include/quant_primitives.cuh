@@ -94,29 +94,24 @@ __device__ __forceinline__ void unpack_w4_to_half2_quad(
     half scale,
     half2 out_h2[4]
 ) {
-    int q0 = (packed >> 0)  & 0xF;
-    int q4 = (packed >> 4)  & 0xF;
-    int q1 = (packed >> 8)  & 0xF;
-    int q5 = (packed >> 12) & 0xF;
-    int q2 = (packed >> 16) & 0xF;
-    int q6 = (packed >> 20) & 0xF;
-    int q3 = (packed >> 24) & 0xF;
-    int q7 = (packed >> 28) & 0xF;
+    // .qwenbin v1 interleaves nibbles as: q0|q4<<4 | q1<<8|q5<<12 | q2<<16|q6<<20 | q3<<24|q7<<28.
+    // Biasing with 0x6400 (FP16 1024.0) maps integer q in [0,15] to 1024+q, then subtracting
+    // 0x6408 (1032.0) yields exact (q - 8) in FP16x2 without FP32 roundtrips.
+    constexpr uint32_t FP16_BIAS_1024 = 0x64006400u;
+    constexpr uint32_t FP16_BIAS_1032 = 0x64086408u;
 
-    float s = __half2float(scale);
-    float w0 = (static_cast<float>(q0) - 8.0f) * s;
-    float w1 = (static_cast<float>(q1) - 8.0f) * s;
-    float w2 = (static_cast<float>(q2) - 8.0f) * s;
-    float w3 = (static_cast<float>(q3) - 8.0f) * s;
-    float w4 = (static_cast<float>(q4) - 8.0f) * s;
-    float w5 = (static_cast<float>(q5) - 8.0f) * s;
-    float w6 = (static_cast<float>(q6) - 8.0f) * s;
-    float w7 = (static_cast<float>(q7) - 8.0f) * s;
+    uint32_t u01 = (packed & 0x000Fu) | ((packed & 0x0F00u) << 8) | FP16_BIAS_1024;
+    uint32_t u23 = ((packed >> 16) & 0x000Fu) | ((packed >> 8) & 0x000F0000u) | FP16_BIAS_1024;
+    uint32_t u45 = ((packed >> 4) & 0x000Fu) | ((packed << 4) & 0x000F0000u) | FP16_BIAS_1024;
+    uint32_t u67 = ((packed >> 20) & 0x000Fu) | ((packed >> 12) & 0x000F0000u) | FP16_BIAS_1024;
 
-    out_h2[0] = make_half2(__float2half(w0), __float2half(w1));
-    out_h2[1] = make_half2(__float2half(w2), __float2half(w3));
-    out_h2[2] = make_half2(__float2half(w4), __float2half(w5));
-    out_h2[3] = make_half2(__float2half(w6), __float2half(w7));
+    half2 bias = *reinterpret_cast<const half2*>(&FP16_BIAS_1032);
+    half2 s2   = __half2half2(scale);
+
+    out_h2[0] = __hmul2(__hsub2(*reinterpret_cast<const half2*>(&u01), bias), s2);
+    out_h2[1] = __hmul2(__hsub2(*reinterpret_cast<const half2*>(&u23), bias), s2);
+    out_h2[2] = __hmul2(__hsub2(*reinterpret_cast<const half2*>(&u45), bias), s2);
+    out_h2[3] = __hmul2(__hsub2(*reinterpret_cast<const half2*>(&u67), bias), s2);
 }
 
 } // namespace qwen

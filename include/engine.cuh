@@ -171,6 +171,7 @@ private:
 
     std::string qwenbin_path_;
     int device_id_{0};
+    int sm_count_{0};
     size_t max_seq_len_{4096};
     QuantMode quant_mode_{QuantMode::W4A16_G128};
     bool weights_16byte_aligned_{true};

@@ -208,6 +208,7 @@ void QwenEngine::load_model_file(const std::string& qwenbin_path) {
 }
 
 void QwenEngine::setup_arena() {
+    CUDA_CHECK(cudaDeviceGetAttribute(&sm_count_, cudaDevAttrMultiProcessorCount, device_id_));
     layers_.resize(NUM_LAYERS);
 
     uint64_t w_offset = model_config_.header().weights_offset;
@@ -481,7 +482,7 @@ void QwenEngine::execute_gqa_prefill_layer(int l, int chunk_start, int chunk_len
         layers_[l].v_weight, layers_[l].v_scale, ws_.d_v
     };
     launch_gemm_prefill_qkv_w4a16(qkv_view, ws_.d_act_1, chunk_len, stream_,
-                                  HIDDEN_SIZE, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM);
+                                  HIDDEN_SIZE, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM, sm_count_);
 
     launch_qkv_bias_rope_kv_append(
         ws_.d_q, ws_.d_k, ws_.d_v,
@@ -498,7 +499,7 @@ void QwenEngine::execute_gqa_prefill_layer(int l, int chunk_start, int chunk_len
 
     launch_gemm_prefill_w4a16(
         reinterpret_cast<const uint32_t*>(layers_[l].o_weight), layers_[l].o_scale,
-        ws_.d_attn_out, ws_.d_act_0, ws_.d_act_0, chunk_len, HIDDEN_SIZE, Q_DIM, stream_
+        ws_.d_attn_out, ws_.d_act_0, ws_.d_act_0, chunk_len, HIDDEN_SIZE, Q_DIM, stream_, sm_count_
     );
 }
 
@@ -520,7 +521,7 @@ void QwenEngine::execute_prefill_chunk(int chunk_start, int chunk_len) {
         );
         launch_gemm_prefill_w4a16(
             reinterpret_cast<const uint32_t*>(layers_[l].down_weight), layers_[l].down_scale,
-            ws_.d_mlp_act, ws_.d_act_0, ws_.d_act_0, chunk_len, HIDDEN_SIZE, INTERMEDIATE_SIZE, stream_
+            ws_.d_mlp_act, ws_.d_act_0, ws_.d_act_0, chunk_len, HIDDEN_SIZE, INTERMEDIATE_SIZE, stream_, sm_count_
         );
     }
 }
@@ -692,7 +693,7 @@ StageProfile QwenEngine::profile_stages(const std::vector<int32_t>& prompt_token
                     layers_[l].v_weight, layers_[l].v_scale, ws_.d_v
                 };
                 launch_gemm_prefill_qkv_w4a16(qkv_view, ws_.d_act_1, chunk_len, stream_,
-                                              HIDDEN_SIZE, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM);
+                                              HIDDEN_SIZE, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM, sm_count_);
             });
             time_stage(profile.prefill.rope_kv_ms, [&]() {
                 launch_qkv_bias_rope_kv_append(
@@ -712,7 +713,7 @@ StageProfile QwenEngine::profile_stages(const std::vector<int32_t>& prompt_token
             time_stage(profile.prefill.o_proj_ms, [&]() {
                 launch_gemm_prefill_w4a16(
                     reinterpret_cast<const uint32_t*>(layers_[l].o_weight), layers_[l].o_scale,
-                    ws_.d_attn_out, ws_.d_act_0, ws_.d_act_0, chunk_len, HIDDEN_SIZE, Q_DIM, stream_
+                    ws_.d_attn_out, ws_.d_act_0, ws_.d_act_0, chunk_len, HIDDEN_SIZE, Q_DIM, stream_, sm_count_
                 );
             });
             time_stage(profile.prefill.post_norm_ms, [&]() {
@@ -727,7 +728,7 @@ StageProfile QwenEngine::profile_stages(const std::vector<int32_t>& prompt_token
             time_stage(profile.prefill.down_proj_ms, [&]() {
                 launch_gemm_prefill_w4a16(
                     reinterpret_cast<const uint32_t*>(layers_[l].down_weight), layers_[l].down_scale,
-                    ws_.d_mlp_act, ws_.d_act_0, ws_.d_act_0, chunk_len, HIDDEN_SIZE, INTERMEDIATE_SIZE, stream_
+                    ws_.d_mlp_act, ws_.d_act_0, ws_.d_act_0, chunk_len, HIDDEN_SIZE, INTERMEDIATE_SIZE, stream_, sm_count_
                 );
             });
         }

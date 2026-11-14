@@ -583,6 +583,34 @@ bool run_golden_reference_suite(
                 all_passed = false;
             }
 
+            // Verify small-M (32x32) tile path via sm_count=40 + in-place residual (residual == output_y)
+            launch_gemm_prefill_w4a16(
+                reinterpret_cast<const uint32_t*>(engine_w4a16->layer_weights(0).q_weight),
+                engine_w4a16->layer_weights(0).q_scale,
+                d_test_in, nullptr, d_test_out, 8, Q_DIM, HIDDEN_SIZE, stream, 40
+            );
+            CUDA_CHECK(cudaMemcpy(h_test_out.data(), d_test_out, 8 * Q_DIM * sizeof(half), cudaMemcpyDeviceToHost));
+            float cos_prefill_small = compute_cosine_similarity(h_test_out.data(), ref_q_raw, 8 * Q_DIM);
+            std::cout << "  - W4A16 Prefill 32x32 Small-M Cosine Sim: " << cos_prefill_small << " (threshold: >= 0.990)" << std::endl;
+            if (cos_prefill_small < 0.990f) {
+                std::cerr << "  FAILED: W4A16 Prefill 32x32 Small-M cosine similarity below 0.990!" << std::endl;
+                all_passed = false;
+            }
+
+            // In-place residual check (residual == output_y): should double the output
+            launch_gemm_prefill_w4a16(
+                reinterpret_cast<const uint32_t*>(engine_w4a16->layer_weights(0).q_weight),
+                engine_w4a16->layer_weights(0).q_scale,
+                d_test_in, d_test_out, d_test_out, 8, Q_DIM, HIDDEN_SIZE, stream, 40
+            );
+            CUDA_CHECK(cudaMemcpy(h_test_out.data(), d_test_out, 8 * Q_DIM * sizeof(half), cudaMemcpyDeviceToHost));
+            float cos_prefill_res = compute_cosine_similarity(h_test_out.data(), ref_q_raw, 8 * Q_DIM);
+            std::cout << "  - W4A16 Prefill In-Place Residual Cosine Sim: " << cos_prefill_res << " (threshold: >= 0.990)" << std::endl;
+            if (cos_prefill_res < 0.990f) {
+                std::cerr << "  FAILED: W4A16 Prefill In-Place Residual cosine similarity below 0.990!" << std::endl;
+                all_passed = false;
+            }
+
             // Prefill Merged QKV W4A16 test
             QKVProjectionView qkv_view_w4 = {
                 engine_w4a16->layer_weights(0).q_weight, engine_w4a16->layer_weights(0).q_scale, d_test_q,

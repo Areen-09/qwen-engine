@@ -33,6 +33,9 @@ constexpr int32_t PREFILL_WMMA_BM     = 64;
 constexpr int32_t PREFILL_WMMA_BN     = 64;
 constexpr int32_t PREFILL_WMMA_BK     = 32;
 constexpr int32_t PREFILL_SMEM_STRIDE = 40; // BK=32 + 8 half skew
+constexpr int32_t PREFILL_SMEM_STAGES = 2;
+constexpr int32_t PREFILL_SMALL_BM    = 32;
+constexpr int32_t PREFILL_SMALL_BN    = 32;
 constexpr int32_t DECODE_ROWS_PER_WARP = 4;
 constexpr float   LOG2_ROPE_THETA     = 19.931568569324174f; // log2(1000000.0f)
 

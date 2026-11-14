@@ -11,17 +11,17 @@ import urllib.request
 import urllib.error
 from .exceptions import ModelNotFoundError, QwenEngineError
 
-DEFAULT_HF_REPO = "cuda-projects/qwen2.5-1.5b-w4a16"
+DEFAULT_HF_REPO = "areen09/qwen-engine-models-qwenbin"
 
 KNOWN_MODELS = {
     "qwen2.5-1.5b-w4a16": {
         "repo": DEFAULT_HF_REPO,
-        "weight_file": "qwen25_1.5b_w4a16.qwenbin",
+        "weight_file": "qwen2.5-1.5b-w4a16.qwenbin",
         "tokenizer_file": "tokenizer.bin",
     },
     "qwen25-1.5b-w4a16": {
         "repo": DEFAULT_HF_REPO,
-        "weight_file": "qwen25_1.5b_w4a16.qwenbin",
+        "weight_file": "qwen2.5-1.5b-w4a16.qwenbin",
         "tokenizer_file": "tokenizer.bin",
     },
 }
@@ -180,7 +180,7 @@ def download(
         tok_name = meta["tokenizer_file"]
     elif "/" in model_id_or_path:
         repo = model_id_or_path
-        weight_name = "qwen25_1.5b_w4a16.qwenbin"
+        weight_name = "qwen2.5-1.5b-w4a16.qwenbin"
         tok_name = "tokenizer.bin"
     else:
         # Check if local model folder matches

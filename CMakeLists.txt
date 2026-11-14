@@ -7,11 +7,11 @@ endif()
 set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "Embedded")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -allow-unsupported-compiler")
 
-# Target Ampere SM 8.6 (RTX 3050) by default; override via CMAKE_CUDA_ARCHITECTURES env var
+# Target Turing SM 7.5 (T4) and Ampere SM 8.6 (RTX 3050) in a single build; override via CMAKE_CUDA_ARCHITECTURES env var
 if(DEFINED ENV{CMAKE_CUDA_ARCHITECTURES})
     set(CMAKE_CUDA_ARCHITECTURES $ENV{CMAKE_CUDA_ARCHITECTURES})
 else()
-    set(CMAKE_CUDA_ARCHITECTURES "86")
+    set(CMAKE_CUDA_ARCHITECTURES "75;86")
 endif()
 
 project(qwen25_cuda LANGUAGES CXX CUDA)
