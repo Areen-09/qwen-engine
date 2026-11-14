@@ -7,11 +7,11 @@ endif()
 set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "Embedded")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -allow-unsupported-compiler")
 
-# Support multi-architecture CUDA targets (T4, A100, RTX 30/40, H100)
+# Target Ampere SM 8.6 (RTX 3050) by default; override via CMAKE_CUDA_ARCHITECTURES env var
 if(DEFINED ENV{CMAKE_CUDA_ARCHITECTURES})
     set(CMAKE_CUDA_ARCHITECTURES $ENV{CMAKE_CUDA_ARCHITECTURES})
 else()
-    set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90;90-virtual")
+    set(CMAKE_CUDA_ARCHITECTURES "86")
 endif()
 
 project(qwen25_cuda LANGUAGES CXX CUDA)
@@ -62,48 +62,21 @@ include_directories(
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 
-option(ENABLE_NCCL "Build with NCCL backend on Linux" OFF)
-
-if(ENABLE_NCCL AND NOT WIN32)
-    find_path(NCCL_INCLUDE_DIR NAMES nccl.h PATHS /usr/local/include /usr/include)
-    find_library(NCCL_LIBRARY NAMES nccl PATHS /usr/local/lib /usr/lib)
-    if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
-        message(STATUS "Found NCCL: ${NCCL_LIBRARY}")
-        include_directories(${NCCL_INCLUDE_DIR})
-        add_compile_definitions(QWEN_ENABLE_NCCL)
-    else()
-        message(WARNING "NCCL not found, falling back to zero-dependency P2P communicator")
-        set(ENABLE_NCCL OFF)
-    endif()
-endif()
-
 set(CORE_SOURCES
     src/kernels/rmsnorm_rope.cu
-    src/kernels/gemv_fp16.cu
     src/kernels/gemv_w4a16.cu
     src/kernels/gemm_prefill.cu
     src/kernels/attention_gqa.cu
     src/kernels/sampling.cu
-    src/kernels/deltanet_sm75.cu
     src/engine.cu
     src/tokenizer.cpp
 )
-
-if(ENABLE_NCCL)
-    list(APPEND CORE_SOURCES src/communicator_nccl.cu)
-else()
-    list(APPEND CORE_SOURCES src/communicator_p2p.cu)
-endif()
 
 add_library(qwen_core STATIC ${CORE_SOURCES})
 set_target_properties(qwen_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 set_target_properties(qwen_core PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 set_target_properties(qwen_core PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 target_link_libraries(qwen_core PUBLIC CUDA::cudart_static)
-
-if(ENABLE_NCCL AND NCCL_LIBRARY)
-    target_link_libraries(qwen_core PUBLIC ${NCCL_LIBRARY})
-endif()
 
 # Nanobind Python Bindings Target
 option(BUILD_PYTHON_BINDINGS "Build nanobind Python bindings" ON)
@@ -130,26 +103,11 @@ if(SKBUILD OR BUILD_PYTHON_BINDINGS)
     install(TARGETS _core LIBRARY DESTINATION qwen_engine RUNTIME DESTINATION qwen_engine)
 endif()
 
-# Gate CLI and standalone servers when packaging wheels
+# Gate CLI when packaging wheels
 if(NOT SKBUILD)
     # CLI Benchmark executable
     add_executable(cli_bench src/cli_bench.cpp)
     target_link_libraries(cli_bench PRIVATE qwen_core CUDA::cudart_static)
-
-    # Local HTTP / SSE Chat Server
-    if(WIN32)
-        add_executable(qwen_server src/main_server.cpp)
-        target_link_libraries(qwen_server PRIVATE qwen_core CUDA::cudart_static ws2_32)
-
-        add_executable(qwen_chat src/main_server.cpp)
-        target_link_libraries(qwen_chat PRIVATE qwen_core CUDA::cudart_static ws2_32)
-    else()
-        add_executable(qwen_server src/main_server.cpp)
-        target_link_libraries(qwen_server PRIVATE qwen_core CUDA::cudart_static)
-
-        add_executable(qwen_chat src/main_server.cpp)
-        target_link_libraries(qwen_chat PRIVATE qwen_core CUDA::cudart_static)
-    endif()
 
     # Unit & Integration Kernel Tests
     add_executable(test_kernels tests/test_kernels.cu)

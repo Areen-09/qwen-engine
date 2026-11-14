@@ -29,7 +29,7 @@ public:
     std::vector<int32_t> format_chatml(const std::vector<ChatMessage>& messages) const;
 
     static bool is_eos(int32_t token_id) {
-        return token_id == TOKEN_ENDOFTEXT || token_id == TOKEN_IM_END || token_id == TOKEN_ENDOFTEXT_QWEN38;
+        return token_id == TOKEN_ENDOFTEXT || token_id == TOKEN_IM_END;
     }
 
     int32_t eos_id() const { return eos_id_; }

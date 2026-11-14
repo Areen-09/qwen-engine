@@ -8,8 +8,257 @@
 
 namespace qwen {
 
+namespace {
+
+__device__ __forceinline__ void stage_q8_1_smem(
+    const int8_t* __restrict__ input_q8,
+    const float* __restrict__ input_scale,
+    const int32_t* __restrict__ input_sum8,
+    int8_t* s_x_q8,
+    int32_t* s_x_sum8,
+    float* s_x_scale,
+    int in_features
+) {
+    int num_u4 = in_features / 16;
+    const uint4* in_q8_u4 = reinterpret_cast<const uint4*>(input_q8);
+    uint4* s_q8_u4 = reinterpret_cast<uint4*>(s_x_q8);
+    for (int i = threadIdx.x; i < num_u4; i += blockDim.x) {
+        s_q8_u4[i] = __ldg(&in_q8_u4[i]);
+    }
+    int num_sum8 = in_features / 8;
+    for (int i = threadIdx.x; i < num_sum8; i += blockDim.x) {
+        s_x_sum8[i] = __ldg(&input_sum8[i]);
+    }
+    int num_groups = in_features / QUANT_GROUP_SIZE;
+    for (int i = threadIdx.x; i < num_groups; i += blockDim.x) {
+        s_x_scale[i] = __ldg(&input_scale[i]);
+    }
+    __syncthreads();
+}
+
+__device__ __forceinline__ float eval_u4_group(
+    const uint4* __restrict__ row_qw_u4,
+    const half* __restrict__ row_scales,
+    int step_s,
+    int sub_lane,
+    int group_idx,
+    const int2& x0,
+    const int2& x1,
+    const int2& x2,
+    const int2& x3,
+    const int4& sum8_4,
+    float x_d
+) {
+    uint4 w = __ldg(row_qw_u4 + step_s * 8 + sub_lane);
+    int32_t dot = dp4a_w4_q8_oct(w.x, x0.x, x0.y, sum8_4.x)
+                + dp4a_w4_q8_oct(w.y, x1.x, x1.y, sum8_4.y)
+                + dp4a_w4_q8_oct(w.z, x2.x, x2.y, sum8_4.z)
+                + dp4a_w4_q8_oct(w.w, x3.x, x3.y, sum8_4.w);
+    float w_d = __half2float(__ldg(&row_scales[group_idx]));
+    return static_cast<float>(dot) * (w_d * x_d);
+}
+
+__device__ __forceinline__ float subwarp8_reduce_sum(float val) {
+    val += __shfl_down_sync(0xFFFFFFFF, val, 4);
+    val += __shfl_down_sync(0xFFFFFFFF, val, 2);
+    val += __shfl_down_sync(0xFFFFFFFF, val, 1);
+    return val;
+}
+
+} // namespace
+
 // ----------------------------------------------------------------------------
-// 4-Row-per-Warp W4A8 (__dp4a) GEMV Kernel (decode)
+// 8-Lane Sub-Warp uint4 W4A8 (__dp4a) GEMV Kernel (SM 8.6 decode)
+// ----------------------------------------------------------------------------
+
+__global__ void gemv_w4a8_u4_kernel(
+    const uint32_t* __restrict__ qweight,
+    const half* __restrict__ scales,
+    const int8_t* __restrict__ input_q8,
+    const float* __restrict__ input_scale,
+    const int32_t* __restrict__ input_sum8,
+    const half* __restrict__ residual,
+    half* __restrict__ output_y,
+    int out_features,
+    int in_features
+) {
+    extern __shared__ __align__(16) uint8_t s_mem[];
+    int8_t* s_x_q8 = reinterpret_cast<int8_t*>(s_mem);
+    int32_t* s_x_sum8 = reinterpret_cast<int32_t*>(s_mem + in_features);
+    float* s_x_scale = reinterpret_cast<float*>(s_mem + in_features + (in_features / 8) * sizeof(int32_t));
+    stage_q8_1_smem(input_q8, input_scale, input_sum8, s_x_q8, s_x_sum8, s_x_scale, in_features);
+
+    int sub_warp_id = threadIdx.x >> 3;
+    int sub_lane = threadIdx.x & 7;
+    int row = blockIdx.x * 16 + sub_warp_id;
+    if (row >= out_features) return;
+
+    int num_groups = in_features / QUANT_GROUP_SIZE;
+    int num_steps = in_features / 256;
+    const uint4* row_qw_u4 = reinterpret_cast<const uint4*>(
+        qweight + static_cast<size_t>(row) * (in_features / 8)
+    );
+    const half* row_scales = scales + static_cast<size_t>(row) * num_groups;
+
+    float acc = 0.0f;
+    for (int s = 0; s < num_steps; ++s) {
+        int group_idx = 2 * s + (sub_lane >> 2);
+        int g_u4 = sub_lane & 3;
+        float x_d = s_x_scale[group_idx];
+        int4 sum8_4 = reinterpret_cast<const int4*>(s_x_sum8 + group_idx * 16)[g_u4];
+        const int2* x_p = reinterpret_cast<const int2*>(s_x_q8 + group_idx * 128 + g_u4 * 32);
+        acc += eval_u4_group(
+            row_qw_u4, row_scales, s, sub_lane, group_idx,
+            x_p[0], x_p[1], x_p[2], x_p[3], sum8_4, x_d
+        );
+    }
+
+    acc = subwarp8_reduce_sum(acc);
+    if (sub_lane == 0) {
+        if (residual != nullptr) acc += __half2float(__ldg(&residual[row]));
+        output_y[row] = __float2half(acc);
+    }
+}
+
+__global__ void gemv_qkv_w4a8_u4_kernel(
+    QKVProjectionView view,
+    const int8_t* __restrict__ input_q8,
+    const float* __restrict__ input_scale,
+    const int32_t* __restrict__ input_sum8,
+    int in_features,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim
+) {
+    extern __shared__ __align__(16) uint8_t s_mem[];
+    int8_t* s_x_q8 = reinterpret_cast<int8_t*>(s_mem);
+    int32_t* s_x_sum8 = reinterpret_cast<int32_t*>(s_mem + in_features);
+    float* s_x_scale = reinterpret_cast<float*>(s_mem + in_features + (in_features / 8) * sizeof(int32_t));
+    stage_q8_1_smem(input_q8, input_scale, input_sum8, s_x_q8, s_x_sum8, s_x_scale, in_features);
+
+    int q_dim = num_q_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+    int q_blocks = q_dim / 16;
+    int k_blocks = kv_dim / 16;
+
+    const uint32_t* qweight = nullptr;
+    const half* scales = nullptr;
+    half* output = nullptr;
+    int row_offset = 0;
+
+    if (blockIdx.x < q_blocks) {
+        qweight = reinterpret_cast<const uint32_t*>(view.q_weight);
+        scales  = view.q_scale;
+        output  = view.d_q;
+        row_offset = 0;
+    } else if (blockIdx.x < q_blocks + k_blocks) {
+        qweight = reinterpret_cast<const uint32_t*>(view.k_weight);
+        scales  = view.k_scale;
+        output  = view.d_k;
+        row_offset = q_dim;
+    } else {
+        qweight = reinterpret_cast<const uint32_t*>(view.v_weight);
+        scales  = view.v_scale;
+        output  = view.d_v;
+        row_offset = q_dim + kv_dim;
+    }
+
+    int sub_warp_id = threadIdx.x >> 3;
+    int sub_lane = threadIdx.x & 7;
+    int row = blockIdx.x * 16 + sub_warp_id - row_offset;
+
+    int num_groups = in_features / QUANT_GROUP_SIZE;
+    int num_steps = in_features / 256;
+    const uint4* row_qw_u4 = reinterpret_cast<const uint4*>(
+        qweight + static_cast<size_t>(row) * (in_features / 8)
+    );
+    const half* row_scales = scales + static_cast<size_t>(row) * num_groups;
+
+    float acc = 0.0f;
+    for (int s = 0; s < num_steps; ++s) {
+        int group_idx = 2 * s + (sub_lane >> 2);
+        int g_u4 = sub_lane & 3;
+        float x_d = s_x_scale[group_idx];
+        int4 sum8_4 = reinterpret_cast<const int4*>(s_x_sum8 + group_idx * 16)[g_u4];
+        const int2* x_p = reinterpret_cast<const int2*>(s_x_q8 + group_idx * 128 + g_u4 * 32);
+        acc += eval_u4_group(
+            row_qw_u4, row_scales, s, sub_lane, group_idx,
+            x_p[0], x_p[1], x_p[2], x_p[3], sum8_4, x_d
+        );
+    }
+
+    acc = subwarp8_reduce_sum(acc);
+    if (sub_lane == 0) {
+        output[row] = __float2half(acc);
+    }
+}
+
+__global__ void gemv_dual_gate_up_swiglu_w4a8_u4_kernel(
+    const uint32_t* __restrict__ gate_up_qweight,
+    const half* __restrict__ gate_up_scales,
+    const int8_t* __restrict__ input_q8,
+    const float* __restrict__ input_scale,
+    const int32_t* __restrict__ input_sum8,
+    half* __restrict__ output_mlp,
+    int in_features,
+    int intermediate_size
+) {
+    extern __shared__ __align__(16) uint8_t s_mem[];
+    int8_t* s_x_q8 = reinterpret_cast<int8_t*>(s_mem);
+    int32_t* s_x_sum8 = reinterpret_cast<int32_t*>(s_mem + in_features);
+    float* s_x_scale = reinterpret_cast<float*>(s_mem + in_features + (in_features / 8) * sizeof(int32_t));
+    stage_q8_1_smem(input_q8, input_scale, input_sum8, s_x_q8, s_x_sum8, s_x_scale, in_features);
+
+    int sub_warp_id = threadIdx.x >> 3;
+    int sub_lane = threadIdx.x & 7;
+    int out_feat = blockIdx.x * 16 + sub_warp_id;
+    if (out_feat >= intermediate_size) return;
+
+    int row_gate = 2 * out_feat;
+    int row_up   = 2 * out_feat + 1;
+    int num_groups = in_features / QUANT_GROUP_SIZE;
+    int num_steps = in_features / 256;
+
+    const uint4* row_qw_g = reinterpret_cast<const uint4*>(
+        gate_up_qweight + static_cast<size_t>(row_gate) * (in_features / 8)
+    );
+    const uint4* row_qw_u = reinterpret_cast<const uint4*>(
+        gate_up_qweight + static_cast<size_t>(row_up) * (in_features / 8)
+    );
+    const half* row_sc_g = gate_up_scales + static_cast<size_t>(row_gate) * num_groups;
+    const half* row_sc_u = gate_up_scales + static_cast<size_t>(row_up) * num_groups;
+
+    float acc_gate = 0.0f;
+    float acc_up   = 0.0f;
+
+    for (int s = 0; s < num_steps; ++s) {
+        int group_idx = 2 * s + (sub_lane >> 2);
+        int g_u4 = sub_lane & 3;
+        float x_d = s_x_scale[group_idx];
+        int4 sum8_4 = reinterpret_cast<const int4*>(s_x_sum8 + group_idx * 16)[g_u4];
+        const int2* x_p = reinterpret_cast<const int2*>(s_x_q8 + group_idx * 128 + g_u4 * 32);
+        int2 x0 = x_p[0], x1 = x_p[1], x2 = x_p[2], x3 = x_p[3];
+
+        acc_gate += eval_u4_group(
+            row_qw_g, row_sc_g, s, sub_lane, group_idx,
+            x0, x1, x2, x3, sum8_4, x_d
+        );
+        acc_up += eval_u4_group(
+            row_qw_u, row_sc_u, s, sub_lane, group_idx,
+            x0, x1, x2, x3, sum8_4, x_d
+        );
+    }
+
+    acc_gate = subwarp8_reduce_sum(acc_gate);
+    acc_up   = subwarp8_reduce_sum(acc_up);
+    if (sub_lane == 0) {
+        float silu = acc_gate / (1.0f + expf(-acc_gate));
+        output_mlp[out_feat] = __float2half(silu * acc_up);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// 4-Row-per-Warp W4A8 (__dp4a) GEMV Kernel (uint32_t fallback)
 // ----------------------------------------------------------------------------
 
 __global__ void gemv_w4a8_kernel(
@@ -629,9 +878,15 @@ void launch_gemv_w4a8(
     int grid = (out_features + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
     size_t smem = static_cast<size_t>(in_features) * 49 / 32;
 
-    gemv_w4a8_kernel<<<grid, BLOCK_THREADS, smem, stream>>>(
-        qweight, scales, input_q8, input_scale, input_sum8, residual, output_y, out_features, in_features
-    );
+    if ((reinterpret_cast<uintptr_t>(qweight) & 15) == 0 && (in_features % 256) == 0) {
+        gemv_w4a8_u4_kernel<<<grid, BLOCK_THREADS, smem, stream>>>(
+            qweight, scales, input_q8, input_scale, input_sum8, residual, output_y, out_features, in_features
+        );
+    } else {
+        gemv_w4a8_kernel<<<grid, BLOCK_THREADS, smem, stream>>>(
+            qweight, scales, input_q8, input_scale, input_sum8, residual, output_y, out_features, in_features
+        );
+    }
     CUDA_KERNEL_CHECK();
 }
 
@@ -654,9 +909,19 @@ void launch_gemv_qkv_w4a8(
     int grid = (total_rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
     size_t smem = static_cast<size_t>(in_features) * 49 / 32;
 
-    gemv_qkv_w4a8_kernel<<<grid, BLOCK_THREADS, smem, stream>>>(
-        view, input_q8, input_scale, input_sum8, in_features, num_q_heads, num_kv_heads, head_dim
-    );
+    bool aligned = ((reinterpret_cast<uintptr_t>(view.q_weight) & 15) == 0) &&
+                   ((reinterpret_cast<uintptr_t>(view.k_weight) & 15) == 0) &&
+                   ((reinterpret_cast<uintptr_t>(view.v_weight) & 15) == 0) &&
+                   ((in_features % 256) == 0);
+    if (aligned) {
+        gemv_qkv_w4a8_u4_kernel<<<grid, BLOCK_THREADS, smem, stream>>>(
+            view, input_q8, input_scale, input_sum8, in_features, num_q_heads, num_kv_heads, head_dim
+        );
+    } else {
+        gemv_qkv_w4a8_kernel<<<grid, BLOCK_THREADS, smem, stream>>>(
+            view, input_q8, input_scale, input_sum8, in_features, num_q_heads, num_kv_heads, head_dim
+        );
+    }
     CUDA_KERNEL_CHECK();
 }
 
@@ -672,14 +937,23 @@ void launch_gemv_dual_gate_up_swiglu_w4a8(
     cudaStream_t stream
 ) {
     constexpr int BLOCK_THREADS = 128;
-    constexpr int OUT_PER_BLOCK = 8; // 4 warps * 2 intermediate outputs = 8
-    int grid = (intermediate_size + OUT_PER_BLOCK - 1) / OUT_PER_BLOCK;
     size_t smem = static_cast<size_t>(hidden_size) * 49 / 32;
 
-    gemv_dual_gate_up_swiglu_w4a8_kernel<<<grid, BLOCK_THREADS, smem, stream>>>(
-        gate_up_qweight, gate_up_scales, input_q8, input_scale, input_sum8, output_mlp,
-        hidden_size, intermediate_size
-    );
+    if ((reinterpret_cast<uintptr_t>(gate_up_qweight) & 15) == 0 && (hidden_size % 256) == 0) {
+        constexpr int OUT_PER_BLOCK = 16;
+        int grid = (intermediate_size + OUT_PER_BLOCK - 1) / OUT_PER_BLOCK;
+        gemv_dual_gate_up_swiglu_w4a8_u4_kernel<<<grid, BLOCK_THREADS, smem, stream>>>(
+            gate_up_qweight, gate_up_scales, input_q8, input_scale, input_sum8, output_mlp,
+            hidden_size, intermediate_size
+        );
+    } else {
+        constexpr int OUT_PER_BLOCK = 8; // 4 warps * 2 intermediate outputs = 8
+        int grid = (intermediate_size + OUT_PER_BLOCK - 1) / OUT_PER_BLOCK;
+        gemv_dual_gate_up_swiglu_w4a8_kernel<<<grid, BLOCK_THREADS, smem, stream>>>(
+            gate_up_qweight, gate_up_scales, input_q8, input_scale, input_sum8, output_mlp,
+            hidden_size, intermediate_size
+        );
+    }
     CUDA_KERNEL_CHECK();
 }
 

@@ -8,15 +8,15 @@
 namespace qwen {
 
 // ----------------------------------------------------------------------------
-// GQA Split-K FlashDecoding Stage 1: Zero-Barrier Warp-per-Token
+// GQA Split-K FlashDecoding Stage 1: Zero-Barrier Warp-per-Token (SM 8.6)
+// Specialized for Qwen 2.5-1.5B (HEAD_D = 128, GQA_GROUP_SIZE = 6)
 // Grid: (num_kv_heads, FLASH_DECODE_SPLITS = 16)
-// Threads: 128 (4 warps: warp 0 .. 3)
-// Each 32-lane warp owns HEAD_DIM = 128 (4 elements per lane as uint2)
+// Threads: 128 (4 warps)
 // ----------------------------------------------------------------------------
 
-constexpr int MAX_GQA_GROUP = 16;
+constexpr int QWEN_GQA_GROUP = 6;
+constexpr int QWEN_HEAD_D    = 128;
 
-template <int HEAD_D>
 __global__ void attention_gqa_flash_decode_stage1_kernel(
     const half* __restrict__ q,
     const half* __restrict__ layer_k_cache,
@@ -44,7 +44,7 @@ __global__ void attention_gqa_flash_decode_stage1_kernel(
     int split_start = split_idx * tokens_per_split;
     int split_end   = min(split_start + tokens_per_split, seq_len);
 
-    constexpr int ELEMS_PER_LANE = (HEAD_D == 256) ? 8 : 4;
+    constexpr int ELEMS_PER_LANE = 4; // 32 lanes * 4 = 128
     int tid = threadIdx.x;
     int warp_id = tid / 32;
     int lane_id = tid % 32;
@@ -52,7 +52,7 @@ __global__ void attention_gqa_flash_decode_stage1_kernel(
 
     int q_head_base = kv_head * gqa_group_size;
 
-    // Guard for empty split
+    // Early-exit inactive splits on-device (preserving fixed grid.y for CUDA Graph)
     if (split_start >= split_end) {
         if (tid < gqa_group_size) {
             int q_h = q_head_base + tid;
@@ -63,19 +63,13 @@ __global__ void attention_gqa_flash_decode_stage1_kernel(
         return;
     }
 
-    // Load Query vectors belonging to this KV head into per-lane registers
-    float q_reg[MAX_GQA_GROUP][ELEMS_PER_LANE];
-    for (int h = 0; h < gqa_group_size; ++h) {
-        const half* q_h_ptr = q + static_cast<size_t>(q_head_base + h) * head_dim + d_base;
-        if constexpr (HEAD_D == 256) {
-            uint4 raw_u4 = *reinterpret_cast<const uint4*>(q_h_ptr);
-            const half* raw_h = reinterpret_cast<const half*>(&raw_u4);
-            #pragma unroll
-            for (int p = 0; p < 8; ++p) {
-                q_reg[h][p] = __half2float(raw_h[p]);
-            }
-        } else {
-            uint2 raw_u2 = *reinterpret_cast<const uint2*>(q_h_ptr);
+    // Load Query vectors into registers (6 heads * 4 floats = 24 floats)
+    float q_reg[QWEN_GQA_GROUP][ELEMS_PER_LANE];
+    #pragma unroll
+    for (int h = 0; h < QWEN_GQA_GROUP; ++h) {
+        if (h < gqa_group_size) {
+            const half* q_h_ptr = q + static_cast<size_t>(q_head_base + h) * head_dim + d_base;
+            uint2 raw_u2 = __ldg(reinterpret_cast<const uint2*>(q_h_ptr));
             const half* raw_h = reinterpret_cast<const half*>(&raw_u2);
             #pragma unroll
             for (int p = 0; p < 4; ++p) {
@@ -84,12 +78,12 @@ __global__ void attention_gqa_flash_decode_stage1_kernel(
         }
     }
 
-    // Per-warp online softmax accumulators
-    float m_i[MAX_GQA_GROUP];
-    float d_i[MAX_GQA_GROUP];
-    float o_reg[MAX_GQA_GROUP][ELEMS_PER_LANE];
+    float m_i[QWEN_GQA_GROUP];
+    float d_i[QWEN_GQA_GROUP];
+    float o_reg[QWEN_GQA_GROUP][ELEMS_PER_LANE];
 
-    for (int h = 0; h < gqa_group_size; ++h) {
+    #pragma unroll
+    for (int h = 0; h < QWEN_GQA_GROUP; ++h) {
         m_i[h] = -INFINITY;
         d_i[h] = 0.0f;
         #pragma unroll
@@ -98,123 +92,104 @@ __global__ void attention_gqa_flash_decode_stage1_kernel(
         }
     }
 
-    const float scale = 1.0f / sqrtf(static_cast<float>(HEAD_D));
+    const float scale = 1.0f / sqrtf(static_cast<float>(QWEN_HEAD_D));
 
-    // Inner loop: 4 warps stride by 4 with ZERO __syncthreads() barriers
     for (int t = split_start + warp_id; t < split_end; t += 4) {
         size_t cache_base = (static_cast<size_t>(kv_head) * max_seq_len + t) * head_dim + d_base;
+        uint2 k_u2 = __ldg(reinterpret_cast<const uint2*>(layer_k_cache + cache_base));
+        uint2 v_u2 = __ldg(reinterpret_cast<const uint2*>(layer_v_cache + cache_base));
+        const half* k_h = reinterpret_cast<const half*>(&k_u2);
+        const half* v_h = reinterpret_cast<const half*>(&v_u2);
 
         float k_val[ELEMS_PER_LANE], v_val[ELEMS_PER_LANE];
-        if constexpr (HEAD_D == 256) {
-            uint4 k_u4 = *reinterpret_cast<const uint4*>(layer_k_cache + cache_base);
-            uint4 v_u4 = *reinterpret_cast<const uint4*>(layer_v_cache + cache_base);
-            const half* k_h = reinterpret_cast<const half*>(&k_u4);
-            const half* v_h = reinterpret_cast<const half*>(&v_u4);
-            #pragma unroll
-            for (int p = 0; p < 8; ++p) {
-                k_val[p] = __half2float(k_h[p]);
-                v_val[p] = __half2float(v_h[p]);
-            }
-        } else {
-            uint2 k_u2 = *reinterpret_cast<const uint2*>(layer_k_cache + cache_base);
-            uint2 v_u2 = *reinterpret_cast<const uint2*>(layer_v_cache + cache_base);
-            const half* k_h = reinterpret_cast<const half*>(&k_u2);
-            const half* v_h = reinterpret_cast<const half*>(&v_u2);
-            #pragma unroll
-            for (int p = 0; p < 4; ++p) {
-                k_val[p] = __half2float(k_h[p]);
-                v_val[p] = __half2float(v_h[p]);
-            }
+        #pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            k_val[p] = __half2float(k_h[p]);
+            v_val[p] = __half2float(v_h[p]);
         }
 
-        for (int h = 0; h < gqa_group_size; ++h) {
-            float prod = 0.0f;
-            #pragma unroll
-            for (int p = 0; p < ELEMS_PER_LANE; ++p) {
-                prod += q_reg[h][p] * k_val[p];
-            }
+        #pragma unroll
+        for (int h = 0; h < QWEN_GQA_GROUP; ++h) {
+            if (h < gqa_group_size) {
+                float prod = 0.0f;
+                #pragma unroll
+                for (int p = 0; p < ELEMS_PER_LANE; ++p) {
+                    prod += q_reg[h][p] * k_val[p];
+                }
+                #pragma unroll
+                for (int mask = 16; mask > 0; mask >>= 1) {
+                    prod += __shfl_xor_sync(0xFFFFFFFF, prod, mask);
+                }
 
-            // Warp reduction: broadcast dot sum to all 32 lanes
-            #pragma unroll
-            for (int mask = 16; mask > 0; mask >>= 1) {
-                prod += __shfl_xor_sync(0xFFFFFFFF, prod, mask);
-            }
+                float score = prod * scale;
+                float m_curr = fmaxf(m_i[h], score);
+                float alpha = expf(m_i[h] - m_curr);
+                float beta  = expf(score - m_curr);
 
-            float score = prod * scale;
-            float m_curr = fmaxf(m_i[h], score);
-            float alpha = expf(m_i[h] - m_curr);
-            float beta  = expf(score - m_curr);
-
-            d_i[h] = d_i[h] * alpha + beta;
-            #pragma unroll
-            for (int p = 0; p < ELEMS_PER_LANE; ++p) {
-                o_reg[h][p] = o_reg[h][p] * alpha + beta * v_val[p];
+                d_i[h] = d_i[h] * alpha + beta;
+                #pragma unroll
+                for (int p = 0; p < ELEMS_PER_LANE; ++p) {
+                    o_reg[h][p] = o_reg[h][p] * alpha + beta * v_val[p];
+                }
+                m_i[h] = m_curr;
             }
-            m_i[h] = m_curr;
         }
     }
 
-    // Shared memory cross-warp reduction
-    __shared__ float s_m[MAX_GQA_GROUP][4];
-    __shared__ float s_d[MAX_GQA_GROUP][4];
-    __shared__ float s_o[4][HEAD_D];
+    // Single-barrier parallel cross-warp reduction across all 6 Q heads
+    __shared__ float s_m[QWEN_GQA_GROUP][4];
+    __shared__ float s_d[QWEN_GQA_GROUP][4];
+    __shared__ float s_o[4][QWEN_GQA_GROUP][QWEN_HEAD_D];
 
     if (lane_id < gqa_group_size) {
         s_m[lane_id][warp_id] = m_i[lane_id];
         s_d[lane_id][warp_id] = d_i[lane_id];
     }
+    #pragma unroll
+    for (int h = 0; h < QWEN_GQA_GROUP; ++h) {
+        if (h < gqa_group_size) {
+            #pragma unroll
+            for (int p = 0; p < ELEMS_PER_LANE; ++p) {
+                s_o[warp_id][h][d_base + p] = o_reg[h][p];
+            }
+        }
+    }
     __syncthreads();
 
-    // Merge each head sequentially
-    for (int h = 0; h < gqa_group_size; ++h) {
-        // Store this warp's o_reg into shared memory
+    // All 128 threads merge (h, elem) pairs in parallel
+    int total_elems = gqa_group_size * head_dim;
+    for (int idx = tid; idx < total_elems; idx += blockDim.x) {
+        int h = idx / head_dim;
+        int elem = idx % head_dim;
+
+        float m_max = -INFINITY;
         #pragma unroll
-        for (int p = 0; p < ELEMS_PER_LANE; ++p) {
-            s_o[warp_id][d_base + p] = o_reg[h][p];
-        }
-        __syncthreads();
-
-        // Warp 0 merges the 4 warps' states
-        if (warp_id == 0) {
-            float m_max = -INFINITY;
-            for (int w = 0; w < 4; ++w) {
-                if (s_d[h][w] > 0.0f) {
-                    m_max = fmaxf(m_max, s_m[h][w]);
-                }
-            }
-
-            float d_total = 0.0f;
-            for (int w = 0; w < 4; ++w) {
-                if (s_d[h][w] > 0.0f) {
-                    d_total += s_d[h][w] * expf(s_m[h][w] - m_max);
-                }
-            }
-
-            // Stride across elements in warp 0
-            for (int elem = lane_id; elem < head_dim; elem += 32) {
-                float merged_o = 0.0f;
-                if (d_total > 0.0f) {
-                    for (int w = 0; w < 4; ++w) {
-                        if (s_d[h][w] > 0.0f) {
-                            float factor = expf(s_m[h][w] - m_max);
-                            merged_o += factor * s_o[w][elem];
-                        }
-                    }
-                }
-
-                int q_h = q_head_base + h;
-                size_t out_idx = (static_cast<size_t>(q_h) * FLASH_DECODE_SPLITS + split_idx) * head_dim + elem;
-                splitk_partial_out[out_idx] = merged_o;
-            }
-
-            if (lane_id == 0) {
-                int q_h = q_head_base + h;
-                size_t lse_idx = (static_cast<size_t>(q_h) * FLASH_DECODE_SPLITS + split_idx) * 2;
-                splitk_partial_lse[lse_idx + 0] = m_max;
-                splitk_partial_lse[lse_idx + 1] = d_total;
+        for (int w = 0; w < 4; ++w) {
+            if (s_d[h][w] > 0.0f) {
+                m_max = fmaxf(m_max, s_m[h][w]);
             }
         }
-        __syncthreads();
+
+        float d_total = 0.0f;
+        float merged_o = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            if (s_d[h][w] > 0.0f) {
+                float factor = expf(s_m[h][w] - m_max);
+                d_total += s_d[h][w] * factor;
+                merged_o += factor * s_o[w][h][elem];
+            }
+        }
+
+        int q_h = q_head_base + h;
+        size_t out_idx = (static_cast<size_t>(q_h) * FLASH_DECODE_SPLITS + split_idx) * head_dim + elem;
+        splitk_partial_out[out_idx] = (d_total > 0.0f) ? merged_o : 0.0f;
+
+        if (elem == 0) {
+            size_t lse_idx = (static_cast<size_t>(q_h) * FLASH_DECODE_SPLITS + split_idx) * 2;
+            splitk_partial_lse[lse_idx + 0] = m_max;
+            splitk_partial_lse[lse_idx + 1] = d_total;
+        }
     }
 }
 
@@ -336,13 +311,15 @@ __global__ void attention_gqa_flash_decode_stage2_kernel(
 }
 
 // ----------------------------------------------------------------------------
-// Causal Prefill Attention Kernel (Zero inner-loop barriers, 6 Q heads shared)
-// Grid: (NUM_KV_HEADS, num_tokens)
-// Threads: 128 (4 warps)
+// Shared-Memory K/V-Tiled Causal FlashAttention Prefill Kernel (Br=16, Bc=32)
+// Grid: (num_q_heads, ceil(num_tokens / 16))
+// Threads: 128 (4 warps, each warp owns 4 query rows)
 // ----------------------------------------------------------------------------
 
-template <int HEAD_D>
-__global__ void attention_gqa_prefill_kernel(
+constexpr int PREFILL_BR = 16;
+constexpr int PREFILL_BC = 32;
+
+__global__ void attention_gqa_prefill_flash_kernel(
     const half* __restrict__ q,
     const half* __restrict__ layer_k_cache,
     const half* __restrict__ layer_v_cache,
@@ -355,167 +332,132 @@ __global__ void attention_gqa_prefill_kernel(
     int max_seq_len,
     int hidden_size
 ) {
-    int kv_h = blockIdx.x;
-    int m    = blockIdx.y;
-    if (m >= num_tokens) return;
-
-    constexpr int ELEMS_PER_LANE = (HEAD_D == 256) ? 8 : 4;
-
-    int tid = threadIdx.x;
-    int warp_id = tid / 32;
-    int lane_id = tid % 32;
-    int d_base  = lane_id * ELEMS_PER_LANE;
+    int q_h = blockIdx.x;
+    int q_tile = blockIdx.y;
+    int m_start = q_tile * PREFILL_BR;
+    if (m_start >= num_tokens) return;
 
     int gqa_group_size = num_q_heads / num_kv_heads;
+    int kv_h = q_h / gqa_group_size;
     int q_dim = num_q_heads * head_dim;
-    int q_head_base = kv_h * gqa_group_size;
 
     int base_pos = 0;
     if (d_control != nullptr) {
         base_pos = d_control->seq_pos;
     }
-    int cur_pos = min(base_pos + m, max_seq_len - 1);
-    int seq_len = cur_pos + 1;
 
-    // Load Query vectors into registers
-    float q_reg[MAX_GQA_GROUP][ELEMS_PER_LANE];
-    for (int h = 0; h < gqa_group_size; ++h) {
-        size_t q_idx = static_cast<size_t>(m) * q_dim + (q_head_base + h) * head_dim + d_base;
-        if constexpr (HEAD_D == 256) {
-            uint4 raw_u4 = *reinterpret_cast<const uint4*>(q + q_idx);
-            const half* raw_h = reinterpret_cast<const half*>(&raw_u4);
-            #pragma unroll
-            for (int p = 0; p < 8; ++p) {
-                q_reg[h][p] = __half2float(raw_h[p]);
-            }
-        } else {
-            uint2 raw_u2 = *reinterpret_cast<const uint2*>(q + q_idx);
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    int d_base  = lane_id * 4; // 32 lanes * 4 = 128
+
+    // Each warp owns 4 query rows: m = m_start + warp_id * 4 + r
+    int q_pos[4];
+    float q_reg[4][4];
+    float m_i[4];
+    float d_i[4];
+    float o_reg[4][4];
+
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        int m = m_start + warp_id * 4 + r;
+        q_pos[r] = (m < num_tokens) ? min(base_pos + m, max_seq_len - 1) : -1;
+        m_i[r] = -INFINITY;
+        d_i[r] = 0.0f;
+        #pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            o_reg[r][p] = 0.0f;
+            q_reg[r][p] = 0.0f;
+        }
+        if (m < num_tokens) {
+            size_t q_idx = static_cast<size_t>(m) * q_dim + static_cast<size_t>(q_h) * head_dim + d_base;
+            uint2 raw_u2 = __ldg(reinterpret_cast<const uint2*>(q + q_idx));
             const half* raw_h = reinterpret_cast<const half*>(&raw_u2);
             #pragma unroll
             for (int p = 0; p < 4; ++p) {
-                q_reg[h][p] = __half2float(raw_h[p]);
+                q_reg[r][p] = __half2float(raw_h[p]);
             }
         }
     }
 
-    float m_i[MAX_GQA_GROUP];
-    float d_i[MAX_GQA_GROUP];
-    float o_reg[MAX_GQA_GROUP][ELEMS_PER_LANE];
+    int last_m = min(m_start + PREFILL_BR - 1, num_tokens - 1);
+    int max_kv_len = min(base_pos + last_m, max_seq_len - 1) + 1;
 
-    for (int h = 0; h < gqa_group_size; ++h) {
-        m_i[h] = -INFINITY;
-        d_i[h] = 0.0f;
-        #pragma unroll
-        for (int p = 0; p < ELEMS_PER_LANE; ++p) {
-            o_reg[h][p] = 0.0f;
+    __shared__ __align__(16) half s_K[PREFILL_BC][QWEN_HEAD_D];
+    __shared__ __align__(16) half s_V[PREFILL_BC][QWEN_HEAD_D];
+
+    const float scale = 1.0f / sqrtf(static_cast<float>(QWEN_HEAD_D));
+    const size_t kv_head_offset = static_cast<size_t>(kv_h) * max_seq_len * head_dim;
+
+    for (int t_base = 0; t_base < max_kv_len; t_base += PREFILL_BC) {
+        int tile_len = min(PREFILL_BC, max_kv_len - t_base);
+
+        // Cooperatively load K and V tiles into shared memory (uint4 = 8 halfs, 16 threads per row)
+        int total_u4 = tile_len * (QWEN_HEAD_D / 8); // <= 32 * 16 = 512
+        for (int idx = tid; idx < total_u4; idx += blockDim.x) {
+            int k_row = idx >> 4;
+            int k_col_u4 = idx & 15;
+            size_t src_idx = kv_head_offset + static_cast<size_t>(t_base + k_row) * head_dim + k_col_u4 * 8;
+            *reinterpret_cast<uint4*>(&s_K[k_row][k_col_u4 * 8]) = __ldg(reinterpret_cast<const uint4*>(layer_k_cache + src_idx));
+            *reinterpret_cast<uint4*>(&s_V[k_row][k_col_u4 * 8]) = __ldg(reinterpret_cast<const uint4*>(layer_v_cache + src_idx));
         }
-    }
+        __syncthreads();
 
-    const float scale = 1.0f / sqrtf(static_cast<float>(HEAD_D));
-
-    // Sweeping cached tokens: 4 warps stride by 4 with ZERO __syncthreads() barriers
-    for (int t = warp_id; t < seq_len; t += 4) {
-        size_t cache_base = (static_cast<size_t>(kv_h) * max_seq_len + t) * head_dim + d_base;
-
-        float k_val[ELEMS_PER_LANE], v_val[ELEMS_PER_LANE];
-        if constexpr (HEAD_D == 256) {
-            uint4 k_u4 = *reinterpret_cast<const uint4*>(layer_k_cache + cache_base);
-            uint4 v_u4 = *reinterpret_cast<const uint4*>(layer_v_cache + cache_base);
-            const half* k_h = reinterpret_cast<const half*>(&k_u4);
-            const half* v_h = reinterpret_cast<const half*>(&v_u4);
-            #pragma unroll
-            for (int p = 0; p < 8; ++p) {
-                k_val[p] = __half2float(k_h[p]);
-                v_val[p] = __half2float(v_h[p]);
-            }
-        } else {
-            uint2 k_u2 = *reinterpret_cast<const uint2*>(layer_k_cache + cache_base);
-            uint2 v_u2 = *reinterpret_cast<const uint2*>(layer_v_cache + cache_base);
+        for (int k_idx = 0; k_idx < tile_len; ++k_idx) {
+            int kv_pos = t_base + k_idx;
+            uint2 k_u2 = *reinterpret_cast<const uint2*>(&s_K[k_idx][d_base]);
+            uint2 v_u2 = *reinterpret_cast<const uint2*>(&s_V[k_idx][d_base]);
             const half* k_h = reinterpret_cast<const half*>(&k_u2);
             const half* v_h = reinterpret_cast<const half*>(&v_u2);
+
+            float k_val[4], v_val[4];
             #pragma unroll
             for (int p = 0; p < 4; ++p) {
                 k_val[p] = __half2float(k_h[p]);
                 v_val[p] = __half2float(v_h[p]);
             }
-        }
-
-        for (int h = 0; h < gqa_group_size; ++h) {
-            float prod = 0.0f;
-            #pragma unroll
-            for (int p = 0; p < ELEMS_PER_LANE; ++p) {
-                prod += q_reg[h][p] * k_val[p];
-            }
 
             #pragma unroll
-            for (int mask = 16; mask > 0; mask >>= 1) {
-                prod += __shfl_xor_sync(0xFFFFFFFF, prod, mask);
-            }
-
-            float score = prod * scale;
-            float m_curr = fmaxf(m_i[h], score);
-            float alpha = expf(m_i[h] - m_curr);
-            float beta  = expf(score - m_curr);
-
-            d_i[h] = d_i[h] * alpha + beta;
-            #pragma unroll
-            for (int p = 0; p < ELEMS_PER_LANE; ++p) {
-                o_reg[h][p] = o_reg[h][p] * alpha + beta * v_val[p];
-            }
-            m_i[h] = m_curr;
-        }
-    }
-
-    // Shared memory cross-warp reduction
-    __shared__ float s_m[MAX_GQA_GROUP][4];
-    __shared__ float s_d[MAX_GQA_GROUP][4];
-    __shared__ float s_o[4][HEAD_D];
-
-    if (lane_id < gqa_group_size) {
-        s_m[lane_id][warp_id] = m_i[lane_id];
-        s_d[lane_id][warp_id] = d_i[lane_id];
-    }
-    __syncthreads();
-
-    for (int h = 0; h < gqa_group_size; ++h) {
-        #pragma unroll
-        for (int p = 0; p < ELEMS_PER_LANE; ++p) {
-            s_o[warp_id][d_base + p] = o_reg[h][p];
-        }
-        __syncthreads();
-
-        if (warp_id == 0) {
-            float m_max = -INFINITY;
-            for (int w = 0; w < 4; ++w) {
-                if (s_d[h][w] > 0.0f) {
-                    m_max = fmaxf(m_max, s_m[h][w]);
-                }
-            }
-
-            float d_total = 0.0f;
-            for (int w = 0; w < 4; ++w) {
-                if (s_d[h][w] > 0.0f) {
-                    d_total += s_d[h][w] * expf(s_m[h][w] - m_max);
-                }
-            }
-
-            for (int elem = lane_id; elem < head_dim; elem += 32) {
-                float merged_o = 0.0f;
-                if (d_total > 0.0f) {
-                    for (int w = 0; w < 4; ++w) {
-                        if (s_d[h][w] > 0.0f) {
-                            float factor = expf(s_m[h][w] - m_max);
-                            merged_o += factor * s_o[w][elem];
-                        }
+            for (int r = 0; r < 4; ++r) {
+                if (q_pos[r] >= kv_pos) {
+                    float prod = q_reg[r][0] * k_val[0] + q_reg[r][1] * k_val[1]
+                               + q_reg[r][2] * k_val[2] + q_reg[r][3] * k_val[3];
+                    #pragma unroll
+                    for (int mask = 16; mask > 0; mask >>= 1) {
+                        prod += __shfl_xor_sync(0xFFFFFFFF, prod, mask);
                     }
-                }
 
-                float final_val = (d_total > 0.0f) ? (merged_o / d_total) : 0.0f;
-                size_t out_idx = static_cast<size_t>(m) * hidden_size + (q_head_base + h) * head_dim + elem;
-                attn_out[out_idx] = __float2half(final_val);
+                    float score = prod * scale;
+                    float m_curr = fmaxf(m_i[r], score);
+                    float alpha = expf(m_i[r] - m_curr);
+                    float beta  = expf(score - m_curr);
+
+                    d_i[r] = d_i[r] * alpha + beta;
+                    #pragma unroll
+                    for (int p = 0; p < 4; ++p) {
+                        o_reg[r][p] = o_reg[r][p] * alpha + beta * v_val[p];
+                    }
+                    m_i[r] = m_curr;
+                }
             }
         }
         __syncthreads();
+    }
+
+    // Write normalized output
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        int m = m_start + warp_id * 4 + r;
+        if (m < num_tokens) {
+            float inv_d = (d_i[r] > 0.0f) ? (1.0f / d_i[r]) : 0.0f;
+            half out_h[4];
+            #pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                out_h[p] = __float2half(o_reg[r][p] * inv_d);
+            }
+            size_t out_idx = static_cast<size_t>(m) * hidden_size + static_cast<size_t>(q_h) * head_dim + d_base;
+            *reinterpret_cast<uint2*>(attn_out + out_idx) = *reinterpret_cast<const uint2*>(out_h);
+        }
     }
 }
 
@@ -541,17 +483,10 @@ void launch_attention_gqa_flash_decode(
     int32_t* out_sum8
 ) {
     dim3 grid_stage1(num_kv_heads, FLASH_DECODE_SPLITS);
-    if (head_dim == 256) {
-        attention_gqa_flash_decode_stage1_kernel<256><<<grid_stage1, 128, 0, stream>>>(
-            q, layer_k_cache, layer_v_cache, splitk_partial_out, splitk_partial_lse, d_control,
-            num_q_heads, num_kv_heads, head_dim, max_seq_len
-        );
-    } else {
-        attention_gqa_flash_decode_stage1_kernel<128><<<grid_stage1, 128, 0, stream>>>(
-            q, layer_k_cache, layer_v_cache, splitk_partial_out, splitk_partial_lse, d_control,
-            num_q_heads, num_kv_heads, head_dim, max_seq_len
-        );
-    }
+    attention_gqa_flash_decode_stage1_kernel<<<grid_stage1, 128, 0, stream>>>(
+        q, layer_k_cache, layer_v_cache, splitk_partial_out, splitk_partial_lse, d_control,
+        num_q_heads, num_kv_heads, head_dim, max_seq_len
+    );
     CUDA_KERNEL_CHECK();
 
     dim3 grid_stage2(num_q_heads, 1);
@@ -575,18 +510,11 @@ void launch_attention_gqa_prefill(
     int max_seq_len,
     int hidden_size
 ) {
-    dim3 grid(num_kv_heads, num_tokens);
-    if (head_dim == 256) {
-        attention_gqa_prefill_kernel<256><<<grid, 128, 0, stream>>>(
-            q, layer_k_cache, layer_v_cache, attn_out, d_control, num_tokens,
-            num_q_heads, num_kv_heads, head_dim, max_seq_len, hidden_size
-        );
-    } else {
-        attention_gqa_prefill_kernel<128><<<grid, 128, 0, stream>>>(
-            q, layer_k_cache, layer_v_cache, attn_out, d_control, num_tokens,
-            num_q_heads, num_kv_heads, head_dim, max_seq_len, hidden_size
-        );
-    }
+    dim3 grid(num_q_heads, (num_tokens + PREFILL_BR - 1) / PREFILL_BR);
+    attention_gqa_prefill_flash_kernel<<<grid, 128, 0, stream>>>(
+        q, layer_k_cache, layer_v_cache, attn_out, d_control, num_tokens,
+        num_q_heads, num_kv_heads, head_dim, max_seq_len, hidden_size
+    );
     CUDA_KERNEL_CHECK();
 }
 

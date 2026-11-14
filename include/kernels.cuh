@@ -8,16 +8,6 @@
 namespace qwen {
 
 // 1. Embedding lookup
-void launch_embed_lookup_fp16(
-    const half* embed_table,
-    const int32_t* d_token_ids,
-    half* out_hidden,
-    const DeviceControlBlock* d_control,
-    int num_tokens,
-    cudaStream_t stream,
-    int hidden_size = HIDDEN_SIZE
-);
-
 void launch_embed_lookup_w4a16(
     const uint32_t* embed_qweight,
     const half* embed_scales,
@@ -66,37 +56,7 @@ void launch_quantize_fp16_to_q8_1(
     cudaStream_t stream
 );
 
-// 3. Vectorized FP16 GEMV (decode)
-void launch_gemv_fp16(
-    const half* weight,
-    const half* input_x,
-    const half* residual,
-    half* output_y,
-    int out_features,
-    int in_features,
-    cudaStream_t stream
-);
-
-void launch_gemv_qkv_fp16(
-    const QKVProjectionView& view,
-    const half* input_x,
-    cudaStream_t stream,
-    int in_features = HIDDEN_SIZE,
-    int num_q_heads = NUM_Q_HEADS,
-    int num_kv_heads = NUM_KV_HEADS,
-    int head_dim = HEAD_DIM
-);
-
-void launch_gemv_dual_gate_up_swiglu_fp16(
-    const half* gate_up_weight,
-    const half* input_x,
-    half* output_mlp,
-    int hidden_size,
-    int intermediate_size,
-    cudaStream_t stream
-);
-
-// 4. Fused W4A16 & W4A8 GEMV (decode)
+// 3. Fused W4A16 & W4A8 GEMV (decode)
 void launch_gemv_w4a16(
     const uint32_t* qweight,
     const half* scales,
@@ -155,39 +115,7 @@ void launch_gemv_dual_gate_up_swiglu_w4a8(
     cudaStream_t stream
 );
 
-// 5. Tiled Prefill GEMM (M <= 256)
-void launch_gemm_prefill_fp16(
-    const half* weight,
-    const half* input_x,
-    const half* residual,
-    half* output_y,
-    int M,
-    int N,
-    int K,
-    cudaStream_t stream
-);
-
-void launch_gemm_prefill_qkv_fp16(
-    const QKVProjectionView& view,
-    const half* input_x,
-    int M,
-    cudaStream_t stream,
-    int in_features = HIDDEN_SIZE,
-    int num_q_heads = NUM_Q_HEADS,
-    int num_kv_heads = NUM_KV_HEADS,
-    int head_dim = HEAD_DIM
-);
-
-void launch_gemm_prefill_dual_gate_up_swiglu_fp16(
-    const half* gate_up_weight,
-    const half* input_x,
-    half* output_mlp,
-    int M,
-    cudaStream_t stream,
-    int hidden_size = HIDDEN_SIZE,
-    int intermediate_size = INTERMEDIATE_SIZE
-);
-
+// 4. Tiled Prefill GEMM (M <= 256)
 void launch_gemm_prefill_w4a16(
     const uint32_t* qweight,
     const half* scales,
@@ -243,25 +171,7 @@ void launch_qkv_bias_rope_kv_append(
     float rope_theta = ROPE_THETA
 );
 
-// 6b. Gated DeltaNet Recurrent Step (Conv1d + 16 KB SMEM Sub-tiled Delta recurrence)
-void launch_deltanet_step(
-    const half* input,
-    const half* conv1d_weight,
-    const half* conv1d_bias,
-    half* conv_state,
-    const half* q,
-    const half* k,
-    const half* v,
-    const half* beta,
-    float* s_state,
-    half* out,
-    int hidden_size,
-    int num_heads,
-    int head_dim,
-    cudaStream_t stream
-);
-
-// 7. GQA FlashDecoding & Causal Prefill Attention
+// 6. GQA FlashDecoding & Causal Prefill Attention
 void launch_attention_gqa_flash_decode(
     const half* q,
     const half* layer_k_cache,
@@ -304,17 +214,6 @@ void launch_sample_and_advance(
     int32_t* d_mapped_pinned_token,
     cudaStream_t stream,
     int vocab_size = VOCAB_SIZE
-);
-
-void launch_sample_candidate(
-    const half* logits,
-    float* sample_scratch_val,
-    int32_t* sample_scratch_idx,
-    const DeviceControlBlock* d_control,
-    PinnedCandidate* d_out_cand,
-    int32_t index_offset,
-    int vocab_size,
-    cudaStream_t stream
 );
 
 } // namespace qwen

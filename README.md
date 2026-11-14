@@ -1,250 +1,79 @@
-# qwen-engine: Bare-Metal CUDA & Python Inference Engine
+# qwen-engine: Bare-Metal CUDA Inference for Qwen 2.5-1.5B
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![CUDA 11.8+](https://img.shields.io/badge/CUDA-11.8%2B%20%7C%2012.x%20%7C%2013.x-green.svg)](https://developer.nvidia.com/cuda-toolkit)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-purple.svg)](https://en.cppreference.com/w/cpp/20)
-[![Wheels CI](https://github.com/Areen-09/qwen-engine/actions/workflows/wheels.yml/badge.svg)](https://github.com/Areen-09/qwen-engine/actions/workflows/wheels.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A high-performance C++20 and custom CUDA inference engine and Python package built from scratch for the **Qwen** model family, including:
-- **Qwen 2.5-1.5B:** Dense Grouped-Query Attention (GQA) transformer.
-- **Qwen 3.5-4B:** Hybrid linear attention model interleaving Gated DeltaNet and GQA in a 3:1 ratio (75% KV cache reduction).
-- **Qwen 3.8-27B:** Dual-GPU hybrid model distributing Gated DeltaNet and GQA across 2 GPUs using 2-way Tensor Parallelism ($TP=2$) over PCIe.
+A dedicated, zero-dependency C++20 and custom CUDA inference engine for **Qwen 2.5-1.5B-Instruct** in **W4A16 (Group-128)** precision, tuned for NVIDIA Ampere GPUs (**RTX 3050 Laptop GPU, 4 GB VRAM, SM 8.6**).
 
-Designed to run at maximum memory bandwidth with zero external math runtime libraries—**no cuBLAS, cuDNN, CUTLASS, or PyTorch** required at runtime. The compiled Python extension statically bundles the CUDA runtime (`CUDA::cudart_static`), allowing end users to run high-throughput LLM inference on any system with NVIDIA drivers (`>= 450.80.02`), without requiring the CUDA Toolkit to be installed.
+Zero external math runtime libraries—**no cuBLAS, cuDNN, CUTLASS, or PyTorch** required at runtime.
 
 ---
 
-## Supported Models Matrix
+## Performance vs. `llama.cpp` (`Q4_K_M`, RTX 3050 Laptop GPU)
 
-| Model | Parameters | Hidden Size ($H$) | Intermediate Size ($I$) | Layer Topology | Quantization | Disk Footprint | Peak VRAM | Target Hardware |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Qwen 2.5-1.5B** | 1.54B | 1536 | 8960 | 28 GQA Layers | W4A16 (G128) | **796 MB** | **~943 MB** | Single GPU (`cuda:0`) / RTX 3050 (4 GB) / Tesla T4 |
-| **Qwen 3.5-4B** | ~3.8B | 2560 | 10240 | 32 Layers (24 DeltaNet : 8 GQA) | W4A16 (G128) | **~2.4 GB** | **~2.8 GB** | Single GPU (`cuda:0`) / Tesla T4 (16 GB) |
-| **Qwen 3.8-27B** | ~27B | 5120 | 27648 | 64 Layers (48 DeltaNet : 16 GQA) | W4A16 Dual-Rank ($TP=2$) | **~7.1 GB / rank** | **~7.8 GB / GPU** | Dual GPU (`cuda:0` & `cuda:1`) / 2x Tesla T4 (32 GB) |
+Measured on NVIDIA GeForce RTX 3050 Laptop GPU (4095 MiB VRAM, 192 GB/s peak bandwidth, Windows):
 
-For comprehensive architecture details, selective KV cache savings formulas, and memory layout proofs, see **[`docs/MODELS.md`](docs/MODELS.md)**. For the exact binary container format, see **[`docs/SPECIFICATION.md`](docs/SPECIFICATION.md)**.
+| Metric | `qwen-engine` (W4A16 G128) | `llama.cpp` (`Q4_K_M`, `-ngl 99 -fa 1`) | Speedup |
+| :--- | ---: | ---: | ---: |
+| **Prefill `p=128`** | **3,247.60 tok/s** (`39.41 ms` TTFT) | 2,136.33 tok/s | **1.52x** |
+| **Prefill `p=512`** | **2,869.85 tok/s** (`178.41 ms` TTFT) | 2,587.90 tok/s | **1.11x** |
+| **Prefill `p=1024`** | 2,356.60 tok/s (`434.52 ms` TTFT) | 2,561.69 tok/s | 0.92x |
+| **Decode `tg128` (`p=512`)** | **177.24 tok/s** | 61.19 tok/s | **2.90x** |
+| **Decode `tg256` (`p=128`)** | **178.17 tok/s** (`144.86 GB/s`, 75.5% peak) | 60.98 tok/s | **2.92x** |
+| **Discrete VRAM Used** | **879.35 MB** (759.31 MB weights + 112.00 MB KV + 8.04 MB workspace) | ~1.04 GiB+ | — |
 
----
-
-## Key Highlights
-
-- **Zero Math Runtime Dependencies:** Handcrafted CUDA kernels for RMSNorm, RoPE, Grouped-Query Attention (GQA), Gated DeltaNet linear attention, W4A16 GEMV, SwiGLU, and fused device sampling.
-- **Unified Hybrid Architecture (DeltaNet + GQA):** Native support for hybrid models alternating GQA attention and fused Gated DeltaNet sm_75 linear recurrence. Selective KV cache allocation cuts VRAM requirements by up to 75% on recurrent layers.
-- **Cross-Platform Tensor Parallelism:** High-performance 2-way TP engine with zero external communication dependencies. Uses direct BAR1 P2P with CUDA event sync on Windows (with double-buffered staging fallback under WDDM) and NCCL on Linux.
-- **Universal GGUF & HuggingFace Importer:** Direct ingestion from standard GGUF v2/v3 or PyTorch safetensors with on-the-fly warp-interleaved W4A16 quantization and dynamic `.qwenbin` v2 serialization.
-- **Ultra-Low Memory Footprint (<1 GB VRAM):**
-  - **W4A16 (Group 128):** ~943 MB total discrete VRAM for weights, activations, and KV cache. Runs comfortably on 4 GB laptop GPUs (e.g. RTX 3050).
-  - **FP16 Baseline:** ~3,234 MB total discrete VRAM.
-- **Zero-Update Device-Driven CUDA Graphs:** Forward pass and sampling reduction are captured into a single CUDA graph. Sequence positions and token IDs are updated in device global memory via a `DeviceControlBlock`, avoiding host graph updates.
-- **Tied Embedding Quantization (120 MB vs 467 MB):** The tied `151936 x 1536` vocabulary table is symmetrically quantized to W4A16. Row dequantization during input lookup takes `<2 µs`, cutting `lm_head` memory bandwidth by 74%.
-- **GQA 6:1 Split-K FlashDecoding:** 2D grid `(NUM_KV_HEADS=2, FLASH_DECODE_SPLITS=16)` saturates all SMs, caching Query heads in shared memory once and streaming KV cache tokens with 6x reduced bandwidth.
-- **Pythonic High-Level API:** Full Python package (`qwen-engine`) featuring synchronous/asynchronous token streaming, transactional session rollback, HuggingFace auto-downloading, and native exception handling.
+See **[`comparison.md`](comparison.md)** for full benchmark methodology, stage-by-stage profiling, and Phase 1 vs. Phase 2 comparisons, **[`docs/MODELS.md`](docs/MODELS.md)** for memory formulas, and **[`docs/SPECIFICATION.md`](docs/SPECIFICATION.md)** for the `.qwenbin` binary container spec.
 
 ---
 
-## Python Package Quickstart
+## Key Architecture Highlights
 
-### Installation
-
-From repository source:
-```bash
-pip install .
-```
-
-Or for development (editable mode):
-```bash
-pip install -e . --no-build-isolation
-```
-
-*Requirements: NVIDIA GPU (Compute Capability 7.5 to 9.0), NVIDIA driver, and Python 3.9+.*
+- **8-Lane Sub-Warp `uint4` W4A8 (`__dp4a`) Decode GEMV:** Coalesced 128-bit weight loads (`__ldg`) paired with on-the-fly Q8_1 quantized activations and warp-shuffle reductions.
+- **Shared-Memory K/V-Tiled FlashAttention Prefill (`Br=16, Bc=32`):** Causal online softmax tiling in shared memory with zero register spilling, specialized for `HEAD_DIM=128` and `GQA_GROUP_SIZE=6`.
+- **6:1 GQA Split-K FlashDecoding:** 2D grid `(NUM_KV_HEADS=2, FLASH_DECODE_SPLITS=16)` with single-barrier parallel cross-warp merge and fused Q8_1 epilogue for O-projection.
+- **Zero-Update Device-Driven CUDA Graphs:** Autoregressive decode forward pass + sampling captured into a static `cudaGraphExec_t` driven by `DeviceControlBlock`.
+- **Single-Arena VRAM Management:** `879.35 MB` total discrete VRAM (weights, `max_seq_len=4096` FP16 KV cache, and `8.04 MB` workspace).
 
 ---
 
-### Basic Generation (Single GPU)
+## Quickstart
 
-```python
-from qwen_engine import Engine, SamplingParams
+### 1. Interactive Notebook
 
-# Load local weights or download from HuggingFace Hub cache
-engine = Engine.from_pretrained(
-    model_path="models/qwen25_1.5b_w4a16.qwenbin",
-    tokenizer_path="models/tokenizer.bin",
-    device_id=0,
-)
+Open [`qwen25_1.5b.ipynb`](qwen25_1.5b.ipynb) for a ready-to-run walkthrough of streaming chat, memory inspection, and throughput benchmarking.
 
-# Generate completion
-response = engine.generate(
-    prompt="Explain quantum entanglement in two simple sentences.",
-    sampling_params=SamplingParams(temperature=0.7, top_p=0.9, max_tokens=128),
-)
-print(response)
-```
-
----
-
-### Multi-GPU Dual-Rank Inference (Kaggle 2x Tesla T4, TP=2)
-
-```python
-from qwen_engine import Engine, SamplingParams
-
-# Seamlessly distribute Qwen 3.8-27B across GPU 0 and GPU 1
-engine_27b = Engine.from_pretrained(
-    "areen09/qwen-engine-models-qwenbin",
-    filename="qwen3.8-27b-w4a16",
-    device_ids=[0, 1],
-)
-
-prompt = "<|im_start|>user\nWrite a short poem about CUDA Tensor Cores.<|im_end|>\n<|im_start|>assistant\n"
-for token in engine_27b.stream(prompt, sampling_params=SamplingParams(temperature=0.7, max_tokens=128)):
-    print(token, end="", flush=True)
-print()
-```
-
----
-
-### Real-Time Synchronous Streaming
-
-```python
-from qwen_engine import Engine, SamplingParams
-
-engine = Engine.from_pretrained("models/qwen25_1.5b_w4a16.qwenbin", "models/tokenizer.bin")
-
-params = SamplingParams(temperature=0.8, top_k=50, max_tokens=256)
-for token_text in engine.stream("Write a short haiku about GPUs:", sampling_params=params):
-    print(token_text, end="", flush=True)
-print()
-```
-
----
-
-### Real-Time Asynchronous Streaming (FastAPI / Web Serving)
-
-The native engine releases the Python GIL during decode iterations, allowing concurrent execution:
-
-```python
-import asyncio
-from qwen_engine import Engine, SamplingParams
-
-async def stream_chat():
-    engine = Engine.from_pretrained("models/qwen25_1.5b_w4a16.qwenbin", "models/tokenizer.bin")
-    
-    async for token in engine.stream_async("Tell me three fun facts about space:"):
-        print(token, end="", flush=True)
-    print()
-
-asyncio.run(stream_chat())
-```
-
----
-
-### Multi-Turn Chat & Transactional Rollback
-
-`Engine` retains KV cache state across calls. If generation is interrupted or rejected, you can roll back to any sequence checkpoint without recomputing prefill:
+### 2. Python API
 
 ```python
 from qwen_engine import Engine
 
-engine = Engine.from_pretrained("models/qwen25_1.5b_w4a16.qwenbin", "models/tokenizer.bin")
+engine = Engine("models/qwen25_1.5b_w4a16.qwenbin", "models/tokenizer.bin", device_id=0)
 
-messages = [
-    {"role": "system", "content": "You are a concise programming assistant."},
-    {"role": "user", "content": "What is RAII in C++?"}
-]
-
-# 1. Format ChatML prompt
-prompt = engine.tokenizer.apply_chat_template(messages, add_generation_prompt=True)
-
-# 2. Checkpoint session position before generation
-checkpoint = engine.current_seq_pos
-
-try:
-    for chunk in engine.stream(prompt):
-        print(chunk, end="", flush=True)
-except KeyboardInterrupt:
-    # 3. Rollback KV cache to checkpoint cleanly
-    engine.rollback_to(checkpoint)
-    print("\n[Generation cancelled; KV cache rolled back]")
+for chunk in engine.stream(
+    [{"role": "user", "content": "Explain CUDA Graphs in two sentences."}],
+    max_tokens=128,
+    temperature=0.0,
+):
+    print(chunk, end="", flush=True)
 ```
 
 ---
 
-## C++ Engine & Standalone Tools
-
-For maximum throughput and standalone deployment without Python, you can build the native C++ binaries directly:
-
-### 1. Build via CMake
+## Building & Testing (Windows)
 
 ```powershell
-# Configure release build with Ninja
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+# Configure & compile Release binaries (SM 8.6 by default)
+.\build.bat
+.\build.bat compile
 
-# Build binaries
-cmake --build build --config Release --parallel
+# Run CUDA kernel unit tests & golden reference parity suite
+.\build\test_kernels.exe --golden
+
+# Run CLI benchmark with per-stage CUDA event profiling
+.\build\cli_bench.exe --model models\qwen25_1.5b_w4a16.qwenbin --prompt-len 128 --gen-len 256 --profile-stages
+
+# Run Python integration tests
+pytest tests/
 ```
-
-Binaries produced:
-- `build/cli_bench.exe`: Microbenchmark harness for prefill and decode throughput.
-- `build/qwen_server.exe`: Standalone lightweight HTTP/SSE chat server.
-- `build/test_kernels.exe`: Kernel correctness verification suite.
-
-### 2. Export Weights from HuggingFace
-
-```powershell
-# Export FP16 model and tokenizer
-python tools/export_qwen25.py --mode fp16 --out models/qwen25_1.5b_fp16.qwenbin --tokenizer-out models/tokenizer.bin
-
-# Export W4A16 quantized model
-python tools/export_qwen25.py --mode w4a16 --out models/qwen25_1.5b_w4a16.qwenbin --tokenizer-out models/tokenizer.bin
-```
-
-### 3. Run Deterministic CLI Benchmark
-
-```powershell
-./build/cli_bench.exe --model models/qwen25_1.5b_w4a16.qwenbin --prompt-len 128 --gen-len 256 --warmup 10 --runs 50
-```
-
-### 4. Run the Zero-dGPU-VRAM Web UI
-
-```powershell
-./build/qwen_server.exe --model models/qwen25_1.5b_w4a16.qwenbin --port 8080
-```
-Open `http://127.0.0.1:8080` in your browser. The single-page HTML frontend streams responses via Server-Sent Events (SSE).
-
----
-
-## Testing & Verification
-
-### 1. Standalone Synthetic CUDA Kernel Suites (Zero File Dependencies)
-Run all 5 mathematical kernel verification suites (RMSNorm, RoPE, dynamic GEMV/SwiGLU sweeps across $\{1.5B, 4B, 27B\}$, Gated DeltaNet recurrence, and depthwise Conv1d) in under 3 seconds without downloading any weight files:
-
-```powershell
-./build/test_kernels.exe
-```
-
-### 2. Full Golden Reference Parity Suite (Opt-In)
-Verify end-to-end activation and token parity against PyTorch golden references:
-
-```powershell
-./build/test_kernels.exe --golden models/golden_ref.bin --w4a16 models/qwen25_1.5b_w4a16.qwenbin
-```
-
-### 3. Dynamic Hybrid Engine & Rollback Verification (Python Pytest)
-Run dynamic topology parsing, selective KV cache allocation invariants, and deterministic prefix replay tests:
-
-```bash
-pytest tests/test_dynamic_engine.py tests/test_gguf_converter.py -v
-```
-
----
-
-## Documentation
-
-- 📖 **[Model Architecture & Deployment Guide (`docs/MODELS.md`)](docs/MODELS.md):** Architectural topologies, memory consumption formulas, selective KV cache savings (75%), and multi-GPU topologies ($TP=2$).
-- 📐 **[Technical Specification & Container Layout (`docs/SPECIFICATION.md`)](docs/SPECIFICATION.md):** `.qwenbin` v2 container specification, 216-byte `LayerDescriptor` binary format (`"<2I26Q"`), and dynamic memory arena offsets.
-
----
-
-## License
-
-This project is licensed under the [MIT License](LICENSE).

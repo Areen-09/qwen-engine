@@ -124,7 +124,6 @@ NB_MODULE(_core, m) {
 
     // QuantMode enum
     nb::enum_<qwen::QuantMode>(m, "QuantMode")
-        .value("FP16", qwen::QuantMode::FP16)
         .value("W4A16_G128", qwen::QuantMode::W4A16_G128);
 
     // ArenaStats
@@ -200,7 +199,6 @@ NB_MODULE(_core, m) {
     // NativeEngine
     nb::class_<qwen::QwenEngine>(m, "NativeEngine")
         .def(nb::init<const std::string&, int, size_t>(), "qwenbin_path"_a, "device_id"_a = 0, "max_seq_len"_a = 4096)
-        .def(nb::init<const std::string&, const std::vector<int>&, size_t>(), "model_path"_a, "device_ids"_a, "max_seq_len"_a = 4096)
         .def("prefill", [](qwen::QwenEngine& self, const std::vector<int32_t>& tokens, float temp) {
             nb::gil_scoped_release release;
             return self.prefill(tokens, temp);
@@ -214,7 +212,6 @@ NB_MODULE(_core, m) {
         .def("get_memory_stats", &qwen::QwenEngine::get_memory_stats)
         .def("device_id", &qwen::QwenEngine::device_id)
         .def("num_gqa_layers", &qwen::QwenEngine::num_gqa_layers)
-        .def("num_deltanet_layers", &qwen::QwenEngine::num_deltanet_layers)
         .def("current_seq_pos", &qwen::QwenEngine::current_seq_pos)
         .def("current_token_id", &qwen::QwenEngine::current_token_id)
         .def("try_acquire_session", &qwen::QwenEngine::try_acquire_session)

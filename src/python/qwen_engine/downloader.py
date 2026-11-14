@@ -24,11 +24,6 @@ KNOWN_MODELS = {
         "weight_file": "qwen25_1.5b_w4a16.qwenbin",
         "tokenizer_file": "tokenizer.bin",
     },
-    "qwen2.5-1.5b-fp16": {
-        "repo": "cuda-projects/qwen2.5-1.5b-fp16",
-        "weight_file": "qwen25_1.5b_fp16.qwenbin",
-        "tokenizer_file": "tokenizer.bin",
-    },
 }
 
 
@@ -78,7 +73,7 @@ def _download_file(
 
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "qwen-engine/0.1.0"}
+        headers={"User-Agent": "qwen-engine/0.2.0"}
     )
 
     try:

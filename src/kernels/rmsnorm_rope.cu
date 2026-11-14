@@ -9,42 +9,8 @@
 namespace qwen {
 
 // ----------------------------------------------------------------------------
-// Embedding Lookup Kernels
+// Embedding Lookup Kernel (W4A16)
 // ----------------------------------------------------------------------------
-
-__global__ void embed_lookup_fp16_kernel(
-    const half* __restrict__ embed_table,
-    const int32_t* __restrict__ d_token_ids,
-    half* __restrict__ out_hidden,
-    const DeviceControlBlock* __restrict__ d_control,
-    int num_tokens,
-    int hidden_size
-) {
-    int token_idx = blockIdx.x;
-    if (token_idx >= num_tokens) return;
-
-    int32_t token_id = 0;
-    if (d_token_ids != nullptr) {
-        token_id = d_token_ids[token_idx];
-    } else if (d_control != nullptr) {
-        token_id = d_control->token_id;
-    }
-    if (token_id < 0 || token_id >= VOCAB_SIZE) {
-        token_id = 0;
-    }
-
-    const half* src = embed_table + static_cast<size_t>(token_id) * hidden_size;
-    half* dst = out_hidden + static_cast<size_t>(token_idx) * hidden_size;
-
-    // Vectorized 128-bit loads (8 halfs per uint4)
-    const uint4* src_u4 = reinterpret_cast<const uint4*>(src);
-    uint4* dst_u4 = reinterpret_cast<uint4*>(dst);
-    int num_u4 = hidden_size / 8;
-
-    for (int i = threadIdx.x; i < num_u4; i += blockDim.x) {
-        dst_u4[i] = src_u4[i];
-    }
-}
 
 __global__ void embed_lookup_w4a16_kernel(
     const uint32_t* __restrict__ embed_qweight,
@@ -82,23 +48,6 @@ __global__ void embed_lookup_w4a16_kernel(
 
         reinterpret_cast<uint4*>(dst + i * 8)[0] = *reinterpret_cast<const uint4*>(h2);
     }
-}
-
-void launch_embed_lookup_fp16(
-    const half* embed_table,
-    const int32_t* d_token_ids,
-    half* out_hidden,
-    const DeviceControlBlock* d_control,
-    int num_tokens,
-    cudaStream_t stream,
-    int hidden_size
-) {
-    int block_size = 256;
-    int grid_size = num_tokens;
-    embed_lookup_fp16_kernel<<<grid_size, block_size, 0, stream>>>(
-        embed_table, d_token_ids, out_hidden, d_control, num_tokens, hidden_size
-    );
-    CUDA_KERNEL_CHECK();
 }
 
 void launch_embed_lookup_w4a16(
@@ -213,18 +162,24 @@ __global__ void rmsnorm_q8_1_kernel(
     int32_t* __restrict__ out_sum8,
     int hidden_size
 ) {
-    extern __shared__ half s_norm[];
+    extern __shared__ __align__(16) half s_norm[];
 
-    const half2* in_h2 = reinterpret_cast<const half2*>(input);
-    const half2* gamma_h2 = reinterpret_cast<const half2*>(gamma);
+    const uint4* in_u4 = reinterpret_cast<const uint4*>(input);
+    const uint4* gamma_u4 = reinterpret_cast<const uint4*>(gamma);
+    uint4* s_out_u4 = reinterpret_cast<uint4*>(s_norm);
+    uint4* out_fp16_u4 = reinterpret_cast<uint4*>(output_fp16_opt);
 
-    int num_h2 = hidden_size / 2;
+    int num_u4 = hidden_size / 8;
     float sum_sq = 0.0f;
 
-    for (int i = threadIdx.x; i < num_h2; i += blockDim.x) {
-        half2 val = in_h2[i];
-        float2 f2 = __half22float2(val);
-        sum_sq += f2.x * f2.x + f2.y * f2.y;
+    for (int i = threadIdx.x; i < num_u4; i += blockDim.x) {
+        uint4 v_u4 = __ldg(&in_u4[i]);
+        const half2* vh2 = reinterpret_cast<const half2*>(&v_u4);
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            float2 f2 = __half22float2(vh2[k]);
+            sum_sq += f2.x * f2.x + f2.y * f2.y;
+        }
     }
 
     #pragma unroll
@@ -258,16 +213,21 @@ __global__ void rmsnorm_q8_1_kernel(
 
     float inv_rms = s_inv_rms;
     half2 inv_rms_h2 = __float2half2_rn(inv_rms);
-    half2* s_out_h2 = reinterpret_cast<half2*>(s_norm);
 
-    for (int i = threadIdx.x; i < num_h2; i += blockDim.x) {
-        half2 g = gamma_h2[i];
-        half2 val = in_h2[i];
-        half2 norm_val = __hmul2(val, inv_rms_h2);
-        half2 res = __hmul2(norm_val, g);
-        s_out_h2[i] = res;
-        if (output_fp16_opt != nullptr) {
-            reinterpret_cast<half2*>(output_fp16_opt)[i] = res;
+    for (int i = threadIdx.x; i < num_u4; i += blockDim.x) {
+        uint4 v_u4 = __ldg(&in_u4[i]);
+        uint4 g_u4 = __ldg(&gamma_u4[i]);
+        uint4 r_u4;
+        const half2* vh2 = reinterpret_cast<const half2*>(&v_u4);
+        const half2* gh2 = reinterpret_cast<const half2*>(&g_u4);
+        half2* rh2 = reinterpret_cast<half2*>(&r_u4);
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            rh2[k] = __hmul2(__hmul2(vh2[k], inv_rms_h2), gh2[k]);
+        }
+        s_out_u4[i] = r_u4;
+        if (out_fp16_u4 != nullptr) {
+            out_fp16_u4[i] = r_u4;
         }
     }
     __syncthreads();
@@ -278,7 +238,8 @@ __global__ void rmsnorm_q8_1_kernel(
     int sub_lane = threadIdx.x & 15;
 
     for (int group_idx = half_warp_id; group_idx < num_groups; group_idx += (blockDim.x >> 4)) {
-        const half* g_src = s_norm + group_idx * QUANT_GROUP_SIZE + sub_lane * 8;
+        uint4 g_u4 = *reinterpret_cast<const uint4*>(s_norm + group_idx * QUANT_GROUP_SIZE + sub_lane * 8);
+        const half* g_src = reinterpret_cast<const half*>(&g_u4);
         float vals[8];
         #pragma unroll
         for (int j = 0; j < 8; ++j) {

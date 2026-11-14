@@ -5,33 +5,21 @@
 #include "file_map.hpp"
 #include "cuda_guard.cuh"
 #include "exceptions.hpp"
-#include "communicator.cuh"
-#include "deltanet.cuh"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <vector>
 #include <string>
 #include <memory>
 #include <atomic>
-#include <thread>
 
 namespace qwen {
-
-enum class WorkerOp : uint32_t {
-    IDLE = 0,
-    PREFILL_CHUNK,
-    DECODE_PASS,
-    RESET,
-    ROLLBACK,
-    SHUTDOWN
-};
 
 struct LayerWeights {
     // Normalization
     const half*     input_layernorm{nullptr};
     const half*     post_attention_layernorm{nullptr};
 
-    // GQA Projections
+    // GQA Projections (W4A16 G128)
     const void*     q_weight{nullptr};
     const half*     q_scale{nullptr};
     const half*     q_bias{nullptr};
@@ -44,16 +32,7 @@ struct LayerWeights {
     const void*     o_weight{nullptr};
     const half*     o_scale{nullptr};
 
-    // DeltaNet Projections
-    const half*     conv1d_weight{nullptr};
-    const half*     conv1d_bias{nullptr};
-    const void*     in_proj_weight{nullptr};
-    const half*     in_proj_scale{nullptr};
-    const half*     decay_weight{nullptr};
-    const void*     delta_out_weight{nullptr};
-    const half*     delta_out_scale{nullptr};
-
-    // MLP SwiGLU Projections
+    // MLP SwiGLU Projections (W4A16 G128)
     const void*     gate_up_weight{nullptr};
     const half*     gate_up_scale{nullptr};
     const void*     down_weight{nullptr};
@@ -66,7 +45,7 @@ struct WorkspaceBuffers {
     half*     d_q{nullptr};              // Query projection
     half*     d_k{nullptr};              // Key projection
     half*     d_v{nullptr};              // Value projection
-    half*     d_attn_out{nullptr};       // Attention / DeltaNet output
+    half*     d_attn_out{nullptr};       // Attention output
     half*     d_mlp_act{nullptr};        // MLP intermediate activations
     float*    d_splitk_out{nullptr};     // GQA Split-K partial outputs
     float*    d_splitk_lse{nullptr};     // GQA Split-K max/lse
@@ -75,56 +54,10 @@ struct WorkspaceBuffers {
     int32_t*  d_sample_idx{nullptr};     // Sampler indices
     int32_t*  d_prompt_tokens{nullptr};  // Prompt tokens buffer
 
-    // Carved Q8_1 scratch pointers within d_act_1 slack
+    // Dedicated 16 KB aligned Q8_1 scratch buffers (separate from d_act_1)
     int8_t*   d_act_q8{nullptr};
     float*    d_act_scale{nullptr};
     int32_t*  d_act_sum8{nullptr};
-
-    // DeltaNet intermediate buffer
-    half*     d_deltanet_in{nullptr};
-    half*     d_deltanet_beta{nullptr};
-};
-
-struct CompanionRankState {
-    int device_id{1};
-    int rank{1};
-    std::string qwenbin_path;
-    std::unique_ptr<PlatformFileMap> file_map;
-    const uint8_t* mapped_data{nullptr};
-    size_t mapped_size{0};
-    ModelConfig model_config;
-    QuantMode quant_mode{QuantMode::FP16};
-    std::unique_ptr<GpuArena> arena;
-    cudaStream_t stream{nullptr};
-
-    const void*  d_embed_weight{nullptr};
-    const half*  d_embed_scale{nullptr};
-    const void*  d_lm_head_weight{nullptr};
-    const half*  d_lm_head_scale{nullptr};
-    const half*  d_final_norm{nullptr};
-    std::vector<LayerWeights> layers;
-
-    half* d_k_cache{nullptr};
-    half* d_v_cache{nullptr};
-    std::vector<int> gqa_layer_idx;
-    size_t num_gqa_layers{0};
-
-    float* d_deltanet_state{nullptr};
-    half* d_conv1d_state{nullptr};
-    size_t num_deltanet_layers{0};
-
-    WorkspaceBuffers ws;
-    DeviceControlBlock* d_control{nullptr};
-    int32_t* h_pinned_token{nullptr};
-    int32_t* d_mapped_pinned_token{nullptr};
-    PinnedCandidate* h_pinned_cand{nullptr};
-    PinnedCandidate* d_mapped_pinned_cand{nullptr};
-
-    std::unique_ptr<ICommunicator> comm;
-
-    alignas(64) std::atomic<float> top_val{-1e30f};
-    alignas(64) std::atomic<int32_t> top_idx{-1};
-    alignas(64) std::atomic<int32_t> chosen_token{-1};
 };
 
 struct StageBreakdown {
@@ -164,16 +97,14 @@ struct ArenaStats {
 struct EngineConfig {
     std::string model_path;
     std::string tokenizer_path;
-    std::vector<int> device_ids{0};
+    int device_id{0};
     size_t max_seq_len{4096};
-    bool force_wddm_staging{false};
 };
 
 class QwenEngine {
 public:
     explicit QwenEngine(const EngineConfig& config);
     explicit QwenEngine(const std::string& qwenbin_path, int device_id = 0, size_t max_seq_len = 4096);
-    explicit QwenEngine(const std::string& qwenbin_path, const std::vector<int>& device_ids, size_t max_seq_len = 4096);
     ~QwenEngine();
 
     QwenEngine(const QwenEngine&) = delete;
@@ -189,8 +120,7 @@ public:
     void release_session();
     bool is_generating() const { return is_generating_.load(); }
 
-    int device_id() const { return device_ids_.empty() ? 0 : device_ids_[0]; }
-    const std::vector<int>& device_ids() const { return device_ids_; }
+    int device_id() const { return device_id_; }
 
     // Multi-token prefill with prefix caching: returns the first newly generated token
     int32_t prefill(const std::vector<int32_t>& prompt_tokens, float temperature = 0.0f);
@@ -203,7 +133,7 @@ public:
     int32_t current_token_id() const { return last_token_id_; }
     const std::vector<int32_t>& cached_tokens() const { return cached_tokens_; }
 
-    // Profile breakdown across prefill and decode stages
+    // Profile breakdown across prefill and ungraphed decode stages
     StageProfile profile_stages(const std::vector<int32_t>& prompt_tokens);
 
     ArenaStats get_memory_stats() const;
@@ -213,13 +143,12 @@ public:
     void execute_prefill_chunk(int chunk_start, int chunk_len);
 
     void execute_gqa_decode_layer(int l);
-    void execute_deltanet_decode_layer(int l);
     void execute_gqa_prefill_layer(int l, int chunk_start, int chunk_len);
-    void execute_deltanet_prefill_layer(int l, int chunk_start, int chunk_len);
 
     QuantMode quant_mode() const { return quant_mode_; }
     cudaStream_t stream() const { return stream_; }
     const ModelConfig& config() const { return model_config_; }
+    bool weights_16byte_aligned() const { return weights_16byte_aligned_; }
 
     // Accessors for unit testing
     const LayerWeights& layer_weights(int l) const { return layers_[l]; }
@@ -233,10 +162,7 @@ public:
     int32_t* pinned_token_ptr() const { return h_pinned_token_; }
     half* kv_cache_k() const { return d_k_cache_; }
     half* kv_cache_v() const { return d_v_cache_; }
-    float* deltanet_state() const { return d_deltanet_state_; }
-    half* conv1d_state() const { return d_conv1d_state_; }
-    size_t num_gqa_layers() const { return num_gqa_layers_; }
-    size_t num_deltanet_layers() const { return num_deltanet_layers_; }
+    size_t num_gqa_layers() const { return NUM_LAYERS; }
 
 private:
     void load_model_file(const std::string& qwenbin_path);
@@ -244,10 +170,10 @@ private:
     void capture_decode_graph();
 
     std::string qwenbin_path_;
-    std::vector<int> device_ids_;
-    bool force_wddm_staging_{false};
+    int device_id_{0};
     size_t max_seq_len_{4096};
-    QuantMode quant_mode_{QuantMode::FP16};
+    QuantMode quant_mode_{QuantMode::W4A16_G128};
+    bool weights_16byte_aligned_{true};
     std::atomic<bool> is_generating_{false};
 
     ModelConfig model_config_;
@@ -269,28 +195,15 @@ private:
     const half*  d_final_norm_{nullptr};
     std::vector<LayerWeights> layers_;
 
-    // Selective KV Cache: shape [num_gqa_layers, num_kv_heads, max_seq_len, head_dim]
+    // KV Cache: shape [NUM_LAYERS, NUM_KV_HEADS, max_seq_len, HEAD_DIM]
     half* d_k_cache_{nullptr};
     half* d_v_cache_{nullptr};
-    std::vector<int> gqa_layer_idx_;
-    size_t num_gqa_layers_{0};
-
-    // DeltaNet Recurrent State: shape [num_deltanet_layers, num_attention_heads, 128, 128] FP32
-    float* d_deltanet_state_{nullptr};
-    // Conv1d State Cache: shape [num_deltanet_layers, num_attention_heads, head_dim, 3] FP16
-    half* d_conv1d_state_{nullptr};
-    size_t num_deltanet_layers_{0};
 
     // Workspace & Control
     WorkspaceBuffers ws_;
     DeviceControlBlock* d_control_{nullptr};
     int32_t* h_pinned_token_{nullptr};
     int32_t* d_mapped_pinned_token_{nullptr};
-    PinnedCandidate* h_pinned_cand_{nullptr};
-    PinnedCandidate* d_mapped_pinned_cand_{nullptr};
-
-    // Communicator for multi-GPU Tensor Parallelism
-    std::unique_ptr<ICommunicator> comm_;
 
     // Captured zero-update CUDA Graph
     cudaGraph_t     decode_graph_{nullptr};
@@ -307,29 +220,6 @@ private:
     size_t weights_bytes_{0};
     size_t kv_cache_bytes_{0};
     size_t workspace_bytes_{0};
-
-    // Multi-GPU Companion Worker Thread & Host Staging Channel
-    std::shared_ptr<HostStagingChannel> staging_channel_;
-    CompanionRankState rank1_;
-    std::jthread worker_thread_;
-    alignas(64) std::atomic<uint32_t> worker_op_{0};
-    alignas(64) std::atomic<uint32_t> worker_ack_{0};
-    std::atomic<int32_t> worker_chunk_start_{0};
-    std::atomic<int32_t> worker_chunk_len_{0};
-    std::atomic<int32_t> worker_target_pos_{0};
-
-    void worker_loop(std::stop_token st);
-    void init_rank1();
-    void cleanup_rank1();
-    void execute_rank1_decode_pass();
-    void execute_rank1_prefill_chunk(int chunk_start, int chunk_len);
-    void execute_rank1_gqa_decode_layer(int l);
-    void execute_rank1_deltanet_decode_layer(int l);
-    void execute_rank1_gqa_prefill_layer(int l, int chunk_start, int chunk_len);
-    void execute_rank1_deltanet_prefill_layer(int l, int chunk_start, int chunk_len);
-
-    void dispatch_worker(WorkerOp op);
-    void wait_worker_done();
 };
 
 } // namespace qwen

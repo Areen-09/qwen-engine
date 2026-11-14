@@ -41,25 +41,12 @@ constexpr int32_t TOKEN_PAD           = 151643;
 constexpr int32_t TOKEN_ENDOFTEXT     = 151643;
 constexpr int32_t TOKEN_IM_START      = 151644;
 constexpr int32_t TOKEN_IM_END        = 151645;
-constexpr int32_t TOKEN_ENDOFTEXT_QWEN38 = 248044;
-constexpr int32_t TOKEN_BOS_QWEN38       = 248044;
-
-// Architectural compile-time dimensions for Qwen3.8-27B
-constexpr int32_t QWEN38_NUM_LAYERS        = 64;
-constexpr int32_t QWEN38_HIDDEN_SIZE       = 5120;
-constexpr int32_t QWEN38_INTERMEDIATE_SIZE = 17408;
-constexpr int32_t QWEN38_NUM_Q_HEADS       = 32;
-constexpr int32_t QWEN38_NUM_KV_HEADS      = 4;
-constexpr int32_t QWEN38_HEAD_DIM          = 256;
-constexpr int32_t QWEN38_ROTARY_DIM        = 64;
-constexpr int32_t QWEN38_VOCAB_SIZE        = 248320;
 
 enum class QuantMode : uint32_t {
-    FP16 = 0,
     W4A16_G128 = 1
 };
 
-// Layer weight tensor indices in layer_offsets[28][17] for v1 legacy containers
+// Layer weight tensor indices in layer_offsets[28][17] for .qwenbin v1 containers
 namespace LayerTensorIdx {
     constexpr int INPUT_LAYERNORM          = 0;
     constexpr int Q_WEIGHT                 = 1;
@@ -81,11 +68,11 @@ namespace LayerTensorIdx {
     constexpr int COUNT                    = 17;
 }
 
-// 4096-byte page-aligned header for legacy .qwenbin v1 weight format
+// 4096-byte page-aligned header for .qwenbin v1 weight format
 struct alignas(4096) QWQwenHeader {
     uint32_t magic;               // 0x5157454E ("QWEN")
     uint32_t version;             // 1
-    uint32_t quant_mode;          // 0 = FP16, 1 = W4A16_G128
+    uint32_t quant_mode;          // 1 = W4A16_G128
     uint32_t vocab_size;          // 151936
     uint32_t hidden_size;         // 1536
     uint32_t intermediate_size;   // 8960
@@ -97,7 +84,7 @@ struct alignas(4096) QWQwenHeader {
     uint32_t reserved0;           // 0
 
     uint64_t embed_weight_offset;
-    uint64_t embed_scale_offset;  // 0 if FP16
+    uint64_t embed_scale_offset;
     uint64_t final_norm_offset;
 
     uint64_t layer_offsets[NUM_LAYERS][LayerTensorIdx::COUNT];
@@ -111,8 +98,7 @@ static_assert(sizeof(QWQwenHeader) == 4096, "QWQwenHeader must be exactly 4096 b
 // ----------------------------------------------------------------------------
 
 enum LayerType : uint32_t {
-    LAYER_GQA = 0,       // Standard Grouped Query Attention
-    LAYER_DELTANET = 1   // Gated DeltaNet Linear Attention
+    LAYER_GQA = 0        // Standard Grouped Query Attention
 };
 
 struct alignas(64) QwenBinHeaderV2 {
@@ -157,12 +143,8 @@ struct alignas(8) LayerDescriptor {
     uint64_t v_bias_offset;         // V attention bias
     uint64_t attn_out_weight_offset;// Attention output projection
 
-    // DeltaNet Specific Offsets (Valid when type == LAYER_DELTANET)
-    uint64_t conv1d_weight_offset;  // Depthwise 1D convolution weights
-    uint64_t conv1d_bias_offset;    // Depthwise 1D convolution bias
-    uint64_t in_proj_weight_offset; // Input projection (Q, K, V, Z gates)
-    uint64_t decay_weight_offset;   // Decay projection weights (beta gate)
-    uint64_t delta_out_weight_offset;// DeltaNet output projection
+    // Reserved padding preserving 216-byte .qwenbin v2 binary layout
+    uint64_t reserved_deltanet[5];
 
     // MLP Offsets
     uint64_t mlp_gate_offset;       // SwiGLU gate projection

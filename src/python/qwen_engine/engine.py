@@ -41,18 +41,16 @@ class Engine:
         model_path: Union[str, Path],
         tokenizer_path: Optional[Union[str, Path]] = None,
         device_id: int = 0,
-        device_ids: Optional[Union[int, List[int]]] = None,
         max_seq_len: int = 4096,
     ) -> None:
         """
-        Initialize the inference engine on the designated GPU(s).
+        Initialize the inference engine on the designated GPU.
 
         Args:
             model_path: Path to the quantized .qwenbin weight binary.
             tokenizer_path: Path to the binary tokenizer.bin. If None,
                 searches adjacent to model_path or in standard paths.
             device_id: Target CUDA device ID (default: 0).
-            device_ids: Optional list of target CUDA device IDs for multi-GPU execution.
             max_seq_len: Maximum sequence length for KV cache allocation (default: 4096).
         """
         model_p = Path(model_path).absolute()
@@ -81,37 +79,13 @@ class Engine:
         self._tokenizer_path = str(tokenizer_p)
         self._max_seq_len = max_seq_len
 
-        # Resolve device IDs
-        if device_ids is not None:
-            if isinstance(device_ids, int):
-                self._device_ids = [device_ids]
-            else:
-                self._device_ids = list(device_ids)
-        else:
-            self._device_ids = [device_id]
-
         available_devices = _core.cuda_device_count()
-        for d in self._device_ids:
-            if d < 0 or (available_devices > 0 and d >= available_devices):
-                raise ValueError(f"Invalid CUDA device ID {d}; available devices: {available_devices}")
+        if device_id < 0 or (available_devices > 0 and device_id >= available_devices):
+            raise ValueError(f"Invalid CUDA device ID {device_id}; available devices: {available_devices}")
 
-        self._device_id = self._device_ids[0]
-
+        self._device_id = device_id
         self._tokenizer = _core.NativeTokenizer(self._tokenizer_path)
-        if len(self._device_ids) > 1:
-            print(f"[QwenEngine] Initializing Multi-GPU Tensor Parallelism (TP={len(self._device_ids)}) across devices: {self._device_ids}")
-            if "rank0" in self._model_path:
-                rank1_expected = self._model_path.replace("rank0", "rank1")
-                if os.path.exists(rank1_expected):
-                    print(f"  - Rank 0: {self._model_path} -> cuda:{self._device_ids[0]}")
-                    print(f"  - Rank 1: {rank1_expected} -> cuda:{self._device_ids[1]}")
-                else:
-                    print(f"  - [Warning] Expected Rank 1 container not found at {rank1_expected}")
-            self._engine = _core.NativeEngine(self._model_path, self._device_ids, self._max_seq_len)
-            stats = self._engine.get_memory_stats()
-            print(f"[QwenEngine] Primary GPU Arena Allocated: {stats.total_allocated_bytes / (1024*1024):.2f} MB. VRAM Free: {stats.device_free_bytes / (1024*1024):.2f} MB")
-        else:
-            self._engine = _core.NativeEngine(self._model_path, self._device_id, self._max_seq_len)
+        self._engine = _core.NativeEngine(self._model_path, self._device_id, self._max_seq_len)
 
     @classmethod
     def from_pretrained(
@@ -119,7 +93,6 @@ class Engine:
         model_id_or_path: Optional[Union[str, Path]] = None,
         tokenizer_path: Optional[Union[str, Path]] = None,
         device_id: int = 0,
-        device_ids: Optional[Union[int, List[int]]] = None,
         max_seq_len: int = 4096,
         cache_dir: Optional[Union[str, Path]] = None,
         model_path: Optional[Union[str, Path]] = None,
@@ -134,7 +107,6 @@ class Engine:
                 Hugging Face repo ID, or local file/directory path.
             tokenizer_path: Path to the binary tokenizer.bin.
             device_id: Target GPU device ID (default: 0).
-            device_ids: Optional list of target CUDA device IDs for multi-GPU execution.
             max_seq_len: Maximum sequence length for KV cache allocation (default: 4096).
             cache_dir: Custom directory to store downloaded models.
             model_path: Alias for model_id_or_path.
@@ -151,7 +123,7 @@ class Engine:
                         t_path = hf_hub_download(repo_id=repo_id, filename="tokenizer.bin", cache_dir=cache_dir)
                     except Exception:
                         pass
-                return cls(model_path=m_path, tokenizer_path=t_path, device_id=device_id, device_ids=device_ids, max_seq_len=max_seq_len)
+                return cls(model_path=m_path, tokenizer_path=t_path, device_id=device_id, max_seq_len=max_seq_len)
             except ImportError:
                 pass
 
@@ -161,21 +133,16 @@ class Engine:
 
         target_p = Path(target_model)
         if target_p.is_file():
-            return cls(model_path=target_p, tokenizer_path=tokenizer_path, device_id=device_id, device_ids=device_ids, max_seq_len=max_seq_len)
+            return cls(model_path=target_p, tokenizer_path=tokenizer_path, device_id=device_id, max_seq_len=max_seq_len)
 
         resolved_model, resolved_tok = download(str(target_model), cache_dir=cache_dir)
         actual_tok = tokenizer_path or resolved_tok
-        return cls(model_path=resolved_model, tokenizer_path=actual_tok, device_id=device_id, device_ids=device_ids, max_seq_len=max_seq_len)
+        return cls(model_path=resolved_model, tokenizer_path=actual_tok, device_id=device_id, max_seq_len=max_seq_len)
 
     @property
     def device_id(self) -> int:
         """Get the bound CUDA device ID."""
         return self._engine.device_id()
-
-    @property
-    def num_deltanet_layers(self) -> int:
-        """Number of linear DeltaNet recurrent attention layers."""
-        return self._engine.num_deltanet_layers()
 
     @property
     def num_gqa_layers(self) -> int:

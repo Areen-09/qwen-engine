@@ -88,6 +88,7 @@ scripts/
 
 # Notebooks
 *.ipynb
+!qwen25_1.5b.ipynb
 notebooks/
 
 

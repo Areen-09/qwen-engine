@@ -21,7 +21,7 @@ int main(int argc, char** argv) {
     int runs = 50;
     bool profile_stages_flag = false;
     std::string custom_prompt = "";
-    std::vector<int> device_ids = {0};
+    int device_id = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -33,33 +33,19 @@ int main(int argc, char** argv) {
         else if (arg == "--runs" && i + 1 < argc) runs = std::stoi(argv[++i]);
         else if (arg == "--prompt" && i + 1 < argc) custom_prompt = argv[++i];
         else if (arg == "--profile-stages") profile_stages_flag = true;
-        else if (arg == "--devices" && i + 1 < argc) {
-            std::string dev_str = argv[++i];
-            device_ids.clear();
-            size_t start = 0;
-            while (start < dev_str.size()) {
-                size_t comma = dev_str.find(',', start);
-                if (comma == std::string::npos) comma = dev_str.size();
-                device_ids.push_back(std::stoi(dev_str.substr(start, comma - start)));
-                start = comma + 1;
-            }
-        }
+        else if (arg == "--device" && i + 1 < argc) device_id = std::stoi(argv[++i]);
     }
 
     if (model_path.empty()) {
-        std::cerr << "Usage: cli_bench.exe --model <path_to_qwenbin> [--devices <0,1>] [--tokenizer <path>] [--prompt-len <N>] [--gen-len <M>] [--runs <R>]\n";
+        std::cerr << "Usage: cli_bench.exe --model <path_to_qwenbin> [--device <0>] [--tokenizer <path>] [--prompt-len <N>] [--gen-len <M>] [--runs <R>] [--profile-stages]\n";
         return 1;
     }
 
     std::cout << "====================================================================" << std::endl;
-    std::cout << "  Unified Qwen Custom CUDA Engine Deterministic Benchmark           " << std::endl;
+    std::cout << "  Qwen 2.5-1.5B Custom CUDA Engine Benchmark (W4A16 G128)           " << std::endl;
     std::cout << "====================================================================" << std::endl;
     std::cout << "Model:         " << model_path << std::endl;
-    std::cout << "Devices:       ";
-    for (size_t d = 0; d < device_ids.size(); ++d) {
-        std::cout << device_ids[d] << (d + 1 < device_ids.size() ? ", " : "");
-    }
-    std::cout << std::endl;
+    std::cout << "Device:        cuda:" << device_id << std::endl;
     std::cout << "Prompt Length: " << prompt_len << " tokens" << std::endl;
     std::cout << "Gen Length:    " << gen_len << " tokens" << std::endl;
     std::cout << "Warmup Steps:  " << warmup_steps << " steps" << std::endl;
@@ -68,7 +54,7 @@ int main(int argc, char** argv) {
 
     EngineConfig eng_cfg;
     eng_cfg.model_path = model_path;
-    eng_cfg.device_ids = device_ids;
+    eng_cfg.device_id = device_id;
     QwenEngine engine(eng_cfg);
     ArenaStats mem_stats = engine.get_memory_stats();
 
@@ -175,7 +161,7 @@ int main(int argc, char** argv) {
     std::cout << "                         BENCHMARK RESULTS                          " << std::endl;
     std::cout << "====================================================================" << std::endl;
     std::cout << std::fixed << std::setprecision(2);
-    std::cout << "Model Mode:               " << (mem_stats.mode == QuantMode::FP16 ? "FP16 Baseline" : "W4A16 Group-128") << std::endl;
+    std::cout << "Model Mode:               W4A16 Group-128" << std::endl;
     std::cout << "Total Discrete VRAM Used: " << (mem_stats.total_allocated_bytes / (1024.0 * 1024.0)) << " MB / "
               << (mem_stats.device_total_bytes / (1024.0 * 1024.0)) << " MB ("
               << ((double)mem_stats.total_allocated_bytes / mem_stats.device_total_bytes * 100.0) << "%)" << std::endl;
