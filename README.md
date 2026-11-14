@@ -40,9 +40,11 @@ See **[`comparison.md`](comparison.md)** for full benchmark methodology, stage-b
 
 ## Quickstart
 
-### 1. Interactive Notebook
+### 1. Examples & Notebooks
 
-Open [`qwen25_1.5b.ipynb`](qwen25_1.5b.ipynb) for a ready-to-run walkthrough of streaming chat, memory inspection, and throughput benchmarking.
+See [`examples/`](examples/) for portable scripts and notebooks that install the `v0.2.1` GitHub Release wheel directly and run anywhere (Colab, Kaggle, Windows, Linux):
+- [`examples/usage.ipynb`](examples/usage.ipynb) / [`examples/usage.py`](examples/usage.py) — Streaming ChatML generation, memory stats, and KV rollback.
+- [`examples/benchmark_llamacpp.ipynb`](examples/benchmark_llamacpp.ipynb) / [`examples/benchmark_llamacpp.py`](examples/benchmark_llamacpp.py) — Head-to-head benchmark vs. `llama.cpp` (`Q4_K_M`).
 
 ### 2. Python API
 
